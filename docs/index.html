@@ -11,13 +11,14 @@
       color: #222;
       text-align: center;
       padding: 40px;
+      line-height: 1.7;
     }
     h1 {
       color: #007acc;
       font-size: 2em;
     }
     .container {
-      max-width: 600px;
+      max-width: 700px;
       margin: 0 auto;
     }
     a {
@@ -33,6 +34,27 @@
     a:hover {
       background-color: #005c99;
     }
+    hr {
+      margin: 35px 0;
+    }
+    .summary {
+      text-align: left;
+      background-color: #fff;
+      padding: 25px;
+      border-radius: 12px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+      margin-top: 40px;
+    }
+    .summary h2 {
+      color: #007acc;
+      margin-bottom: 15px;
+      text-align: center;
+    }
+    .summary h3 {
+      color: #007acc;
+      margin-top: 25px;
+      font-size: 1.15em;
+    }
   </style>
 </head>
 <body>
@@ -40,29 +62,56 @@
     <h1>Eden Malka – Biostatistics Labs</h1>
     <p>Weekly biostatistics analyses exploring genomic coverage, GC correction, and CNV detection.</p>
 
-<a href="Week1_Lab.html">Week 1 – Data Cleaning & GC Bias Exploration</a>
-<a href="Week2_Lab.html">Week 2 – Coverage Analysis and Normalization</a>
-<a href="Week5_Lab.html">Week 5 – WLS and GC Correction</a>
-<a href="Week7_Lab.html">Week 7 – CNV Copy Number Estimation</a>
-<a href="Week8_Lab.html">Week 8 – Final CNV Modeling Results</a>
+    <a href="Week1_Lab.html">Week 1 – Data Cleaning & GC Bias Exploration</a>
+    <a href="Week2_Lab.html">Week 2 – Coverage Analysis and Normalization</a>
+    <a href="Week5_Lab.html">Week 5 – WLS and GC Correction</a>
+    <a href="Week7_Lab.html">Week 7 – CNV Copy Number Estimation</a>
+    <a href="Week8_Lab.html">Week 8 – Final CNV Modeling Results</a>
 
+    <hr style="margin:30px 0;">
+    <p><b>Presentations:</b></p>
 
-<hr style="margin:30px 0;">
-<p><b>Presentations:</b></p>
+    <p>
+      📄 <a href="https://drive.google.com/file/d/1hIvNX1fNYKlO9lDUW1XJDnyWqQ9bH1GT/view?usp=sharing" target="_blank">
+        Week 6 Mid Presentation – GC Correction (View on Google Drive)
+      </a>
+    </p>
 
-<p>
-  📄 <a href="https://drive.google.com/file/d/1hIvNX1fNYKlO9lDUW1XJDnyWqQ9bH1GT/view?usp=sharing" target="_blank">
-    Week 6 Mid Presentation – GC Correction (View on Google Drive)
-  </a>
-</p>
+    <p>
+      📄 <a href="Final_Presentation.pdf" target="_blank">
+        Final Presentation – CNV Correction Results
+      </a>
+    </p>
 
-<p>
-  📄 <a href="Final_Presentation.pdf" target="_blank">
-    Final Presentation – CNV Correction Results
-  </a>
-</p>
+    <div class="summary">
+      <h2>Project Summary</h2>
 
-</div>
+      <h3>Week 1 – Data Exploration and Mapping</h3>
+      <p>We began by processing raw sequencing reads into genomic bins and mapping them to reference regions. We explored variability in coverage and examined GC-content bias patterns using descriptive statistics and visual tools. This stage built the foundation for understanding systematic bias in sequencing data.</p>
+
+      <h3>Week 2 – Statistical Modeling of GC Bias</h3>
+      <p>We developed regression models to describe the relationship between read coverage and GC content. Both <b>Weighted Least Squares (WLS)</b> and <b>Cubic Spline regression</b> were fitted to estimate the smooth function f(GC) representing expected coverage as a function of GC content. This established the baseline for normalization and later CNV detection.</p>
+
+      <h3>Week 5 – Model Comparison and Residual Analysis</h3>
+      <p>This lab focused on comparing performance across different bin resolutions (1K, 2.5K, 5K, and 10K). We evaluated bias–variance trade-offs using <b>MAE</b>, <b>Median Absolute Error</b>, and residual analysis. Models included <b>LOESS</b> and <b>Cubic Spline</b> corrections. The results guided the choice of optimal bin size for robust CNV detection.</p>
+
+      <h3>Week 6 – Model Refinement and Simulation Design</h3>
+      <p>This stage bridged empirical modeling and theoretical simulation. We refined the spline-based correction model and introduced <b>Poisson regression</b>, modeling coverage as Y<sub>k</sub> ~ Poisson(Λ<sub>k</sub>), where Λ<sub>k</sub> = f(GC<sub>k</sub>) + ε<sub>k</sub>. Different estimation strategies were explored — <b>MLE</b>, <b>Method of Moments</b>, and <b>MAD</b> — for the variance parameter σ². The analysis also examined <i>UnderSpread</i> and <i>OverSpread</i> behavior using <b>Cubic</b> vs. <b>Natural Splines</b>, forming the basis for the later simulation study.</p>
+
+      <h3>Week 7 – Data Cleaning and Copy Number Estimation</h3>
+      <p>Using the cleaned coverage data (2.5K-bin resolution), we applied spline-based correction to compute copy number estimates (aᵢ). Outlier filtering via <b>LOESS residuals</b> and <b>IQR trimming</b> improved normalization accuracy. The resulting aᵢ distribution confirmed diploid coverage near 1 and identified local CNV deviations.</p>
+
+      <h3>Week 8 – Simulation and Model Validation</h3>
+      <p>The final lab implemented a <b>Poisson-based simulation framework</b> to mimic GC-dependent sequencing bias. We estimated the Poisson variance parameter (σ), generated synthetic datasets with realistic coverage variability, and compared them to observed data using <b>RMSE</b> between fitted and true f(GC) curves. This simulation validated the reliability and interpretability of the modeling approach.</p>
+
+      <h3>Final Presentation – Comprehensive CNV Analysis</h3>
+      <p>The final presentation summarized the complete CNV detection pipeline developed throughout the semester. We compared the performance of <b>Model B, Model C, and Model D</b>, each representing a variation in GC-correction and residual filtering using <b>LOESS</b> and <b>Cubic Spline</b> functions. Key evaluation criteria included the proportion of bins retained after IQR-based outlier filtering, <b>Mean Absolute Error</b>, and the stability of coverage across genomic regions (e.g., 26.5M–28.5M). The analysis demonstrated that combining GC correction with adaptive smoothing (Spline + LOESS) provided the most consistent and biologically interpretable results. This final stage integrated all prior modeling, simulation, and correction steps into a cohesive and validated CNV detection workflow.</p>
+
+      <h3>Summary</h3>
+      <p>Across all stages, we integrated statistical reasoning, computational modeling, and visualization in <b>R</b> to analyze and correct sequencing coverage data. Each lab reflected a deeper layer of insight — from exploratory analysis to model fitting, correction, and simulation — culminating in a reproducible CNV detection pipeline grounded in sound biostatistical principles.</p>
+
+      <p style="text-align:center; margin-top:30px; color:#666;">📊 Created by <b>Eden Malka, Salome Baranes, and Omer Abuhatzira</b> – 2025</p>
+    </div>
+  </div>
 </body>
 </html>
-
