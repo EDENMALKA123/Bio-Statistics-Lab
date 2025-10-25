@@ -1,0 +1,863 @@
+---
+title: "HW2"
+author: "Omer Abuhatzira, Eden Malka, Salome Baranes"
+date: "22 April 2025"
+output: 
+  html_document:
+    code_folding: show
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+Group members:
+
+ - Omer Abuhazira 319119988 omer.abuhatzira@mail.huji.ac.il
+ - Eden Malka 318849940 eden.malka@mail.huji.ac.il
+ - Salome Baranes 209891183 salome.baranes@mail.huji.ac.il
+
+### Disabled warnings
+```{r}
+# Disable warnings
+options(warn = -1)
+```
+
+### Libraries used
+
+```{r libraries, message=FALSE, warning=FALSE, results='hide'}
+# Load necessary libraries
+library(tictoc)
+library(ggplot2)
+library(dplyr)
+library(grid)
+library(tictoc)
+library(scales)
+library(tidyverse)
+library(data.table)
+library(R.utils)
+```
+
+### Paths and Data
+
+```{r paths}
+######## CHANGE THESE FILENAMES
+chr1_B_path = "C:/Users/97250/Downloads"
+
+# Define full paths to files
+gz_file <- file.path(chr1_B_path, "TCGA-13-0723-01A_lib1_all_chr1.forward.gz")
+unzipped_file <- file.path(chr1_B_path, "TCGA-13-0723-01A_lib1_all_chr1.forward")
+
+# Install and load R.utils (if not already installed)
+if (!require("R.utils")) install.packages("R.utils")
+library(R.utils)
+
+# Unzip the file (only if it hasn't already been unzipped)
+if (!file.exists(unzipped_file)) {
+  gunzip(gz_file, destname = unzipped_file, remove = FALSE)
+}
+
+library(data.table)
+chr1_reads <- fread(unzipped_file)
+
+# Assign column names
+colnames(chr1_reads) <- c("Chrom", "Loc", "FragLen")
+
+# View a random sample of 10 rows
+set.seed(123)
+chr1_reads[sample(.N, 10)]
+
+summary(chr1_reads)
+```
+
+## Introduction
+
+In this lab, we will work with real-world genomic alignment data obtained through Next Generation Sequencing (NGS). NGS is a high-throughput technology that enables sequencing of millions of short DNA fragments in a single run. After sequencing, these reads are aligned to a reference genome to investigate biological signals such as fragment distribution and potential copy number variations.
+
+Our goal is to analyze one such alignment file and explore the distribution of fragments across chromosome 1. Specifically, we will use the file:
+
+**TCGA-13-0723-01A_lib1_all_chr1.forward**
+
+This file is assigned to Group B and contains only the **first read** from each fragment pair, mapped to the forward strand of chromosome 1.  
+The file includes three columns:
+- `Chrom`: chromosome number (expected to be 1 for all rows)
+- `Loc`: the genomic coordinate where the read begins
+- `FragLen`: the length of the sequenced fragment, which may carry indirect information about the paired read
+
+A quick sample of the data confirms the structure: all reads are mapped to chromosome 1, with start positions ranging from a few million to over 80 million, and fragment at a fixed length of 75 bases.
+
+These fields will serve as the basis for computing coverage, detecting outliers, and analyzing biological patterns.
+
+
+
+## Part A: Data Structure Exploration
+
+
+### a. Simple Coverage Function
+
+
+```{r}
+# Draw histogram
+hist(chr1_reads$Loc / 1e6,
+     breaks = 100,
+     main = "Distribution of Read Start Positions",
+     xlab = "Genomic Position (in millions of bases)",
+     col = "lightblue",
+     xaxt = "n")  # Disable default x-axis ticks
+
+# Add custom ticks every 10M bases
+axis(side = 1, at = seq(0, 250, by = 10))
+```
+
+To choose a representative region for testing our coverage function, we first created a histogram showing the distribution of read start positions across chromosome 1 (in millions of base pairs). Each bar indicates how many sequencing reads begin within a specific genomic interval. This overview helped us identify areas with dense coverage versus regions with little or no data.
+
+Based on this visualization, we selected the interval between 45 million and 65 million bases. This region was chosen because (1) it is far enough from the chromosome's start, where coverage tends to be low, and (2) it lies within a zone of consistently high read density. These properties make it ideal for evaluating our function under realistic sequencing conditions.
+
+#### The Coverage Function  
+
+To compute the coverage (number of reads starting at each base), we implemented a function called `getReadLine()`. This function uses a loop to scan through sorted read positions and count how many reads begin at each position within a specified genomic region.
+
+It creates a numeric vector representing the coverage for each base between `beg_region` and `end_region`. The function is efficient enough to handle large regions, and is based on the approach shown in class.
+
+
+```{r}
+getReadLine <- function(locations, beg_region, end_region) {
+  region_length <- end_region - beg_region + 1
+  coverage <- numeric(region_length)
+
+  # Go over all reads and manually count them into the coverage vector
+  for (loc in locations) {
+    if (loc >= beg_region && loc <= end_region) {
+      index <- loc - beg_region + 1
+      coverage[index] <- coverage[index] + 1
+    }
+  }
+
+  return(coverage)
+}
+
+# Define region
+beg_region <- 45000000
+end_region <- beg_region + 20000000
+
+# Measure runtime 
+tic("getReadLine – 20 million bases")
+coverage_vector_a <- getReadLine(chr1_reads$Loc, beg_region, end_region)
+time_info <- toc(quiet = TRUE)
+
+# Print additional information
+cat("Vector length:", length(coverage_vector_a), "\n")
+cat("Number of reads in region:", sum(chr1_reads$Loc >= beg_region & chr1_reads$Loc <= end_region), "\n")
+cat("Runtime:", round(time_info$toc - time_info$tic, 2), "seconds\n")
+```
+
+#### Interpretation Of The Results:
+
+The `getReadLine` function was applied to a 20-million-base region (from position 45,000,000 to 65,000,000). The returned coverage vector had a length of **20,000,000**, corresponding to each base in the selected region.
+
+A total of **1,111,645** reads were found to start within this interval, and the function completed execution in approximately **1-2 seconds**. While this runtime is reasonable for a single region, the function relies on an explicit loop over all read positions, which becomes increasingly inefficient for larger datasets or repeated use across the full genome.
+
+While this approach is conceptually clear, its reliance on explicit iteration over all reads makes it computationally expensive when applied to large-scale data.
+
+In the following section, we present a vectorized alternative that achieves the same result with significantly better performance.
+
+
+
+### b. Efficient Coverage Function 
+
+To improve runtime efficiency, we implemented a vectorized version of the coverage function called `getReadLine_faster()`. Instead of looping through each read or base, this function uses R’s built-in `tabulate()` function to count the number of reads starting at each position within the region.
+
+We first filter the reads that fall within the specified region and convert their positions into relative indices. These indices are then passed to `tabulate()` to produce a fast and memory-efficient coverage vector.
+
+
+```{r}
+getReadLine_faster <- function(locations, beg_region, end_region) {
+  # Filter read positions within the selected region
+  relevant_locs <- locations[locations >= beg_region & locations <= end_region]
+  
+  # Convert absolute positions to relative indices
+  indices <- relevant_locs - beg_region + 1
+  
+  # Initialize coverage vector and count reads per position using tabulate
+  region_length <- end_region - beg_region + 1
+  coverage <- tabulate(indices, nbins = region_length)
+  
+  return(coverage)
+}
+
+# Define the same region as in Part (a)
+beg_region <- 45000000
+end_region <- beg_region + 20000000
+
+# Measure execution time
+library(tictoc)
+tic("getReadLine_faster – 20 million bases")
+coverage_vector_b <- getReadLine_faster(chr1_reads$Loc, beg_region, end_region)
+time_info_b <- toc(quiet = TRUE)
+
+# Print additional information
+cat("Vector length:", length(coverage_vector_b), "\n")
+cat("Number of reads in region:", sum(chr1_reads$Loc >= beg_region & chr1_reads$Loc <= end_region), "\n")
+cat("Runtime:", round(time_info_b$toc - time_info_b$tic, 2), "seconds\n")
+```
+
+#### Interpretation Of The Results:
+
+We applied the `getReadLine_faster()` function to the same 20-million-base region (positions 45,000,000 to 65,000,000). The function completed in approximately **0.1-0.7 seconds**, compared to **1-2 seconds** for the loop-based implementation in Part (a). Both versions returned identical coverage vectors, confirming the correctness of the optimized approach.
+
+The main reason for the speedup is the use of `tabulate()`, a built-in compiled function that replaces the need for an explicit loop in R. By first filtering the relevant reads and then translating their positions into relative indices, we are able to count them efficiently and avoid costly iteration over all reads.
+
+This performance gain relies on three key assumptions about the data:
+1. **Read start positions are integers**, and can be used directly as indices relative to the region.
+2. **Reads outside the selected region can be discarded early**, which reduces the data passed to `tabulate()`.
+3. **Read positions are not repeated in high frequency**, so simple counting (without collision handling) is sufficient.
+
+These assumptions are generally satisfied in genomic alignment data, making `getReadLine_faster()` both accurate and substantially faster in practice.
+
+
+
+### c. Runtime Comparison & Coverage Visualization
+
+To evaluate how both functions scale with increasing input size, we compared the runtime performance of `getReadLine()` (loop-based) and `getReadLine_faster()` (vectorized) across genomic regions ranging from 1 million to 20 million bases, in 1 million increments. In all cases, the region started at a fixed genomic position (45 million), and only the length varied—so the X-axis reflects region size rather than genomic location.
+
+For each region size, we measured the total execution time and plotted the results. This approach helps visualize how runtime grows with input size, providing insights into the time complexity and efficiency of each implementation.
+
+
+```{r}
+# Define region start and sizes
+beg_region <- 45000000
+region_sizes <- seq(1e6, 20e6, by = 1e6)
+
+# Initialize vectors for runtimes
+time_slow <- numeric(length(region_sizes))
+time_fast <- numeric(length(region_sizes))
+
+# Measure runtime for each region size
+for (i in seq_along(region_sizes)) {
+  end_region <- beg_region + region_sizes[i] - 1
+  
+  # Slow function timing
+  tic()
+  getReadLine(chr1_reads$Loc, beg_region, end_region)
+  t_slow <- toc(quiet = TRUE)
+  time_slow[i] <- t_slow$toc - t_slow$tic
+  
+  # Fast function timing
+  tic()
+  getReadLine_faster(chr1_reads$Loc, beg_region, end_region)
+  t_fast <- toc(quiet = TRUE)
+  time_fast[i] <- t_fast$toc - t_fast$tic
+}
+
+# Build data frame for plotting
+line_df <- data.frame(
+  RegionSize_M = rep(region_sizes / 1e6, 2),
+  Time_sec = c(time_slow, time_fast),
+  Function = rep(c("Loop-based (getReadLine)", "Vectorized (getReadLine_faster)"), each = length(region_sizes))
+)
+
+# Extract values for 20M comparison
+point_20M <- line_df %>% filter(RegionSize_M == 20)
+y1 <- point_20M$Time_sec[point_20M$Function == "Loop-based (getReadLine)"]
+y2 <- point_20M$Time_sec[point_20M$Function == "Vectorized (getReadLine_faster)"]
+mid_y <- (y1 + y2) / 2
+speed_ratio <- round(y1 / y2, 1)
+
+# Plot the result
+
+ggplot(line_df, aes(x = RegionSize_M, y = Time_sec, color = Function)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c(
+    "Loop-based (getReadLine)" = "#006400",
+    "Vectorized (getReadLine_faster)" = "#0072B2"
+  )) +
+  labs(
+    title = "Runtime Scaling vs. Region Size",
+    x = "Region Size (Millions of Bases)",
+    y = "Elapsed Time (seconds)",
+    color = "Function"
+  ) +
+  scale_x_continuous(limits = c(0, 21), breaks = seq(0, 20, by = 5)) +  # extend limit to allow arrow room
+  scale_y_continuous(limits = c(0, max(line_df$Time_sec) * 1.3)) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "top"
+  ) +
+  # Arrow between the two values at x = 20
+  geom_segment(
+    aes(x = 20.7, xend = 20.7, y = y1, yend = y2),
+    inherit.aes = FALSE,
+    arrow = arrow(ends = "both", type = "closed", length = unit(0.15, "inches")),
+    color = "black",
+    linewidth = 0.9
+  ) +
+  # Speed ratio label next to the arrow
+  geom_label(
+    aes(x = 20.3, y = mid_y, label = paste0(speed_ratio, "× faster")),
+    inherit.aes = FALSE,
+    size = 4.5,
+    fill = "gray90",
+    label.size = 0
+  ) +
+  # Add text labels with exact runtime values
+  geom_text(
+    aes(label = sprintf("%.2f", Time_sec)),
+    vjust = -1.2,
+    size = 3,
+    show.legend = FALSE
+  )
+
+
+
+
+```
+
+#### Interpretation Of The Results:
+
+The results show a clear performance gap between the two approaches. While the runtime of the loop-based function gradually increases with region size, the vectorized function remains consistently fast, with minimal variation. This behavior aligns with expectations: the loop-based function performs a full scan over all reads for each call, while the vectorized version filters and tabulates only relevant positions.
+
+At the 20Mbp region, the vectorized version was about **4.5-6.5× faster**, demonstrating its scalability and suitability for high-throughput genomic analysis.
+
+## Part B: Coverage Patterns and Genomic Interpretation
+
+### d. Histogram of Coverage at Selected Locations
+
+To start, we looked at a 20-million-base region (80M–100M) and created a vector to count how many reads mapped to each base. We used a basic while loop to do the counting and then built a histogram.
+
+To avoid extreme values, we capped any count above 20 and labeled the x- and y-axes manually. The y-axis was shown in millions to make the numbers easier to read.
+
+
+```{r}
+# Define region
+beg_region <- 80000000
+end_region <- 100000000
+
+# Generate coverage vector
+read_line <- getReadLine_faster(chr1_reads$Loc, beg_region, end_region)
+
+# Cap values above 20
+read_line_capped <- pmin(read_line, 20)
+
+# Frequency table
+coverage_table <- as.data.frame(table(read_line_capped))
+colnames(coverage_table) <- c("Fragments", "Count")
+coverage_table$Fragments <- as.numeric(as.character(coverage_table$Fragments))
+coverage_table$Label <- as.character(coverage_table$Fragments)
+coverage_table$Label[coverage_table$Fragments == 20] <- "20+"
+
+# Set Y-axis max dynamically
+y_max <- max(coverage_table$Count)
+y_lim <- y_max * 1.1
+
+# Final plot
+ggplot(coverage_table, aes(x = Fragments, y = Count)) +
+  geom_bar(stat = "identity", fill = "skyblue", color = "black") +
+  geom_text(
+    aes(label = format(Count, big.mark = ",")),
+    vjust = ifelse(coverage_table$Fragments == 0, -1.5, -0.4),
+    hjust = 0.5,
+    size = 3
+  ) +
+  scale_x_continuous(
+    breaks = coverage_table$Fragments,
+    labels = coverage_table$Label
+  ) +
+  scale_y_continuous(labels = comma) +
+  coord_cartesian(ylim = c(0, y_lim)) +
+  labs(
+    title = "Read Coverage per Base (Region: 80M–100M)",
+    x = "Number of Reads per Base",
+    y = "Number of Bases"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold")
+  )
+```
+
+#### Interpretation:
+
+The histogram shows that the vast majority of bases in the 80M–100M region received no reads at all, with over 19 million positions having zero coverage. A small fraction of the bases received one read, and the number of bases decreases sharply as coverage increases. Only a handful of bases exceed 5 reads, and just a few are capped at 20+. This highly skewed distribution highlights the extreme sparsity in the data: most of the region is essentially unmapped, with very limited coverage at the single-base level.
+
+#### log10 transformation:
+
+To improve interpretability and highlight subtle differences in coverage, we applied a log10 transformation to the Y-axis. This approach allows us to compress the large range of counts and visualize variation more clearly across all levels of read depth.
+
+
+
+```{r}
+
+# Define region
+beg_region <- 80000000
+end_region <- 100000000
+
+# Generate coverage vector
+read_line <- getReadLine_faster(chr1_reads$Loc, beg_region, end_region)
+
+# Cap values above 20
+read_line_capped <- pmin(read_line, 20)
+
+# Frequency table
+coverage_table <- as.data.frame(table(read_line_capped))
+colnames(coverage_table) <- c("Fragments", "Count")
+coverage_table$Fragments <- as.numeric(as.character(coverage_table$Fragments))
+coverage_table$Label <- as.character(coverage_table$Fragments)
+coverage_table$Label[coverage_table$Fragments == 20] <- "20+"
+
+# Avoid log(0) by filtering out zero counts (optional)
+coverage_table_nonzero <- coverage_table[coverage_table$Count > 0, ]
+
+# Set Y-axis log10 limits
+y_lim_log <- c(1, 10^ceiling(log10(max(coverage_table_nonzero$Count))))
+
+# Final plot with log-transformed Y-axis
+ggplot(coverage_table_nonzero, aes(x = Fragments, y = Count)) +
+  geom_bar(stat = "identity", fill = "skyblue", color = "black") +
+  geom_text(
+    aes(label = format(Count, big.mark = ",")),
+    vjust = -0.5,
+    hjust = 0.5,
+    size = 3
+  ) +
+  scale_x_continuous(
+    breaks = coverage_table$Fragments,
+    labels = coverage_table$Label
+  ) +
+  scale_y_log10(
+    labels = comma,
+    limits = y_lim_log
+  ) +
+  labs(
+    title = "Log10 Scale - Read Coverage per Base (Region: 80M–100M)",
+    x = "Number of Reads per Base",
+    y = "Number of Bases (log10 scale)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold")
+  )
+
+```
+
+### Interpretation
+
+As shown in the graph, the log-transformed Y-axis reveals a more complete picture of the data. The coverage distribution is extremely right-skewed: most genomic bases in this region have no reads (over 19 million positions), and very few have more than 5 reads.
+
+The log scale effectively spreads out the lower-frequency values, enabling us to distinguish finer patterns that were previously invisible. It highlights how sparse the region truly is, and shows that beyond a few highly-covered bases, most of the genomic positions receive little to no coverage.
+
+### e. Binning and Summarizing Fragment Counts
+
+To analyze coverage across the chromosome in fixed intervals, we define a function that divides the chromosome into bins of equal size (e.g., 10,000 bases) and counts how many fragments fall into each bin. This will serves us to quantify coverage density along the genome and visualize coverage variation by position.
+
+
+```{r}
+# Function to compute binned coverage along the chromosome
+getBinnedCoverage <- function(locations, bin_size = 10000) {
+  max_pos <- max(locations)
+  num_bins <- ceiling(max_pos / bin_size)
+  binned_coverage <- numeric(num_bins)
+  
+  bin_indices <- floor((locations - 1) / bin_size) + 1
+  tab <- table(bin_indices)
+  
+  binned_coverage[as.integer(names(tab))] <- as.integer(tab)
+  
+  return(binned_coverage)
+}
+```   
+
+#### e.1. Visualizing Coverage Across the Chromosome
+
+To check how coverage changes along chromosome 1, we used the 'getBinnedCoverage' function to count how many fragments start in each bin.
+
+To objectively identify bins with abnormally high coverage, we applied a statistical outlier detection method based on the interquartile range (IQR). Specifically, we classified as outliers any bins whose coverage exceeded the threshold defined by Q3 + 1.5 × IQR, where Q3 is the third quartile. This method is suitable because it does not rely on assumptions of normality.
+
+
+```{r}
+# Compute binned coverage
+binned_coverage_chr1 <- getBinnedCoverage(chr1_reads$Loc, bin_size = 10000)
+
+# Calculate IQR-based cutoff
+Q1 <- quantile(binned_coverage_chr1, 0.25)
+Q3 <- quantile(binned_coverage_chr1, 0.75)
+IQR_val <- Q3 - Q1
+outlier_cutoff <- Q3 + 1.5 * IQR_val
+
+# Set up plot limits
+ylim_max <- outlier_cutoff * 1.1  # 10% above cutoff
+
+# Define point colors and sizes
+is_outlier <- binned_coverage_chr1 > outlier_cutoff
+point_colors <- ifelse(is_outlier, "red", "black")
+point_cex <- ifelse(is_outlier, 0.7, 0.4)
+
+# Plot
+plot(
+  x = seq_along(binned_coverage_chr1),
+  y = binned_coverage_chr1,
+  pch = 1,
+  col = point_colors,
+  cex = point_cex,
+  main = "Binned Fragment Coverage (10,000 bp bins)",
+  xlab = "Bin Index (Genome Location)",
+  ylab = "Coverage (number of reads)",
+  ylim = c(0, ylim_max),
+  cex.lab = 0.9,  # Reduce the size of the axis labels
+  cex.axis = 0.8  # Reduce the size of the axis numbers
+)
+
+# Add horizontal cutoff line and display the cutoff number
+abline(h = outlier_cutoff, col = "gray60", lty = 2)
+text(x = 24000, y = outlier_cutoff + 50, labels = paste("Cutoff:", round(outlier_cutoff)), pos = 4, cex = 0.8)
+
+# Add legend (only Outlier)
+legend("topright", legend = c("Outlier"), col = c("red"), pch = 1, cex = 0.8)
+
+# Add custom Y-axis ticks to avoid overlap
+axis(2, at = seq(0, ylim_max, by = 200), cex.axis = 0.8)
+
+
+```
+
+###  Interpretation
+
+In this plot, we show how many reads (coverage) each 10,000-base bin across the chromosome got. Most bins have a normal amount of coverage, but some bins stand out with very high values.
+
+To spot these **outliers**, we used the **IQR method**, which is a common way to detect unusually high data points. First, we calculated the 25th percentile (Q1) and the 75th percentile (Q3) of the coverage values. Then, we defined an outlier as any bin with coverage greater than: Q3 + 1.5 × (Q3 - Q1) - those bins are shown in red on the graph.
+
+We noticed that Only a small number of bins exceed this cutoff, indicating that extreme over-coverage is relatively rare. However, we also notice broad regions — especially between bins 12,000 to 15,000 — where the coverage drops close to zero.
+
+These  low-coverage regions most likely reflect parts of the genome that are hard to sequence, such as repetitive or structurally complex areas. In those regions, the reads don’t align well to the reference genome, so we see very little or no coverage
+
+###  Smoothed Coverage and Outlier Bins
+
+To improve visualization, we used bigger bins (20,000 bp) and added a LOESS smoothing curve to show the overall trend. We also marked the outlier bins with red vertical lines. 
+
+
+```{r}
+
+# Compute binned coverage using your chr1_reads data
+computeCoveragePerBin <- function(locations, bin_size = 20000) {
+  last_position <- max(locations)
+  num_bins <- ceiling(last_position / bin_size)
+  
+  fragments_per_bin <- numeric(num_bins)
+  
+  for (loc in locations) {
+    bin_index <- ceiling(loc / bin_size)
+    if (bin_index <= num_bins) {
+      fragments_per_bin[bin_index] <- fragments_per_bin[bin_index] + 1
+    }
+  }
+  
+  return(fragments_per_bin)
+}
+
+# Apply function to data
+bin_size <- 20000
+fragments_per_bin <- computeCoveragePerBin(chr1_reads$Loc, bin_size)
+
+# Create data frame
+df <- data.frame(
+  Bin = seq_along(fragments_per_bin),
+  Coverage = fragments_per_bin
+)
+
+# Smoothing
+smoothed_line <- loess(Coverage ~ Bin, data = df, span = 0.05)
+df$Smoothed <- predict(smoothed_line)
+
+# Outlier detection
+Q1 <- quantile(df$Coverage, 0.25)
+Q3 <- quantile(df$Coverage, 0.75)
+IQR_val <- Q3 - Q1
+upper_threshold <- Q3 + 1.5 * IQR_val
+df$IsOutlier <- df$Coverage > upper_threshold
+
+# Final plot with legend
+ggplot(df, aes(x = Bin, y = Coverage)) +
+  # Raw signal line (light green)
+  geom_line(aes(color = "Raw Signal"), alpha = 0.4, linewidth = 0.5, show.legend = TRUE) +
+
+  # Red vertical bars for outliers
+  geom_segment(
+    data = subset(df, IsOutlier),
+    aes(x = Bin, xend = Bin, y = 0, yend = Coverage, color = "Outlier"),
+    linewidth = 0.6,
+    show.legend = TRUE
+  ) +
+
+  # Smoothed trend line (purple)
+  geom_smooth(
+    aes(color = "Smoothed Trend"),
+    method = "loess", span = 0.05, se = FALSE, linewidth = 1.2,
+    show.legend = TRUE
+  ) +
+
+  # Color legend definition
+  scale_color_manual(
+    name = "Legend",
+    values = c(
+      "Raw Signal" = "lightgreen",
+      "Outlier" = "#e63946",
+      "Smoothed Trend" = "#6a4c93"
+    )
+  ) +
+
+  labs(
+    title = "Binned Fragment Coverage (20,000 bp bins)",
+    x = "Bin Index (Genome Location)",
+    y = "Coverage (number of reads)"
+  ) +
+  coord_cartesian(ylim = c(0, quantile(df$Coverage, 0.995) * 1.1)) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(color = "black"),
+    legend.position = "top",
+    legend.title = element_text(face = "bold")
+  )
+
+
+```   
+
+###  Interpretation
+
+The green line represents the raw coverage signal, while the purple line overlays a LOESS smoothing curve that makes it easier to follow general trends.
+
+We also used the IQR method to mark outlier bins in red, highlighting areas where coverage is unusually high compared to the rest of the genome. These spikes could represent regions with increased read mapping due to structural variations, duplications, or sequencing artifacts.
+
+We observe a clear dip in coverage between bins 6000–8000, similar to the 12,000–15,000 dip in the previous plot. These low-coverage areas likely correspond to centromeric or repetitive regions that are harder to sequence. The shift in bin index is due to the use of larger bins (20,000 bp) in this plot.
+
+
+#### e.2. Identifying Potential Copy Number Variations 
+
+To better understand local coverage patterns in a specific part of the chromosome, we focused on a zoomed-in region between 80M–100M base pairs. We used a bin size of 20,000 bp and calculated the number of fragments starting in each bin. To highlight unusual coverage levels, we applied an IQR-based method to detect local outliers only—bins with coverage significantly higher than the rest of this specific region. We also added both a soft and strict LOESS smoothing line to show overall trends more clearly.
+
+
+```{r}
+
+# Compute coverage for the entire chromosome
+bin_size <- 20000
+fragments_per_bin <- computeCoveragePerBin(chr1_reads$Loc, bin_size)
+
+# Create full dataframe
+df_all <- data.frame(
+  Bin = seq_along(fragments_per_bin),
+  Coverage = fragments_per_bin
+)
+df_all$Start <- (df_all$Bin - 1) * bin_size
+
+# Zoom into region 80M–100M
+df_zoom <- subset(df_all, Start >= 8e7 & Start <= 1e8)
+
+# Local outlier threshold (IQR-based)
+Q1_zoom <- quantile(df_zoom$Coverage, 0.25)
+Q3_zoom <- quantile(df_zoom$Coverage, 0.75)
+IQR_zoom <- Q3_zoom - Q1_zoom
+local_outlier_cutoff <- Q3_zoom + 1.5 * IQR_zoom
+df_zoom$LocalOutlier <- df_zoom$Coverage > local_outlier_cutoff
+
+# LOESS smoothing lines
+smooth_soft <- loess(Coverage ~ Start, data = df_zoom, span = 0.15)
+smooth_strict <- loess(Coverage ~ Start, data = df_zoom, span = 0.05)
+df_zoom$SmoothSoft <- predict(smooth_soft)
+df_zoom$SmoothStrict <- predict(smooth_strict)
+
+# Final plot: only local outliers in red
+library(ggplot2)
+ggplot(df_zoom, aes(x = Start, y = Coverage)) +
+  geom_line(color = "lightgreen", alpha = 0.4, linewidth = 0.5) +
+
+  geom_line(aes(y = SmoothSoft, color = "Soft LOESS"), linewidth = 1.2) +
+  geom_line(aes(y = SmoothStrict, color = "Strict LOESS"), linewidth = 1.2) +
+
+  geom_segment(
+    data = subset(df_zoom, LocalOutlier),
+    aes(x = Start, xend = Start, y = 0, yend = Coverage, color = "Local Outlier"),
+    linewidth = 0.6
+  ) +
+
+  scale_color_manual(
+    name = "Legend",
+    values = c(
+      "Soft LOESS" = "#1E90FF",
+      "Strict LOESS" = "#6a4c93",
+      "Local Outlier" = "#e63946"
+    )
+  ) +
+  scale_x_continuous(
+    labels = function(x) paste0(x / 1e6, "M"),
+    breaks = seq(8e7, 1e8, by = 2e6),
+    limits = c(8e7, 1e8)
+  ) +
+  scale_y_continuous(limits = c(0, 2000)) +
+  labs(
+    title = "Fragment Coverage Zoom-In (80M–100M Region)",
+    x = "Genome Location (Start Position)",
+    y = "Number of Fragments"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    legend.position = "top",
+    legend.title = element_text(face = "bold")
+  )
+
+
+```
+
+###  Interpretation
+
+In this zoomed-in region of chromosome 1 (80M–100M), most of the coverage looks pretty stable, ranging between 600 and 1100 reads per bin. The two LOESS curves (soft and strict) help us follow the overall trend, which shows some natural fluctuations.
+
+Still, we can clearly see a few local outliers (the red lines), especially between 85M–87M and again around 94M. These bins have much higher coverage than expected based on the local distribution. This could be due to things like duplicated regions or technical issues in sequencing.
+
+Even though they stand out in this zoomed section, these bins weren’t flagged as global outliers—so they’re only unusual compared to their neighbors, not the entire chromosome. (We checked this by the command "any(df_zoom$LocalOutlier & df_zoom$GlobalOutlier")
+That’s why using local IQR is helpful here. 
+
+
+### Conclusions:
+
+In the full-genome plot, there's a clear drop in coverage between bins ~7000–7400 (~140M–148M), which may indicate a copy number loss.
+
+In contrast, the zoom-in plot (80M–100M) shows local outliers but no major coverage loss, So, this region doesn't appear to show signs of a copy number change.
+
+
+### f. Comparison to Theoretical Distributions and Final Interpretation
+
+We computed the binned coverage across the full chromosome (10kb bins) and plotted a histogram zoomed to the range 0–2000 reads per bin. A normal distribution was fitted using the empirical mean and standard deviation, and its density curve was overlaid on the histogram. This allows us to visually assess how closely the coverage follows a normal distribution.
+
+
+```{r}
+# Compute binned coverage
+binned_coverage_chr1 <- getBinnedCoverage(chr1_reads$Loc, bin_size = 10000)
+
+# Use full data without trimming
+full_cov <- binned_coverage_chr1
+
+# Mean and sd for full data
+mu_full <- mean(full_cov)
+sd_full <- sd(full_cov)
+
+# Plot full histogram (zoomed to 0–2000 with fine bins)
+hist(full_cov,
+     breaks = 2000,  
+     probability = TRUE,
+     col = "skyblue",
+     border = "white",
+     main = "Histogram of Marginal Coverage with Normal Fit (All Cells)",
+     xlab = "Coverage (reads per bin)",
+     ylim = c(0, 0.003),
+     xlim = c(0, 2000),
+     xaxt = "n")
+
+# Custom X-axis ticks every 200 units
+axis(side = 1, at = seq(0, 2000, by = 200))
+
+# Add fitted normal curve
+curve(dnorm(x, mean = mu_full, sd = sd_full),
+      col = "darkred",
+      lwd = 2,
+      add = TRUE)
+
+# Add dashed vertical lines to mark "normal" region
+abline(v = c(190, 920), col = "red", lty = 2, lwd = 1.5)
+
+# Add legend
+legend("topright",
+       legend = paste0("N(μ = ", round(mu_full, 1), ", σ = ", round(sd_full, 1), ")"),
+       col = "darkred",
+       lwd = 2,
+       bty = "n")
+
+
+
+
+
+```
+
+The histogram reveals that the empirical coverage distribution is heavily right-skewed, with a sharp peak near zero and a long tail of higher values. While the fitted normal curve (μ ≈ 480.6, σ ≈ 400.8) provides a rough approximation of the central tendency, it clearly fails to capture the asymmetry and the high frequency of low-coverage bins.
+
+The visual gap between the histogram and the curve at both extremes—especially near zero—highlights the poor fit of a normal model in this context, suggesting the data is likely overdispersed and may include zero-inflated or multi-modal components.
+
+
+```{r}
+# Compute binned coverage
+binned_coverage_chr1 <- getBinnedCoverage(chr1_reads$Loc, bin_size = 10000)
+
+# Keep only values between 190 and 920
+normal_region <- binned_coverage_chr1[binned_coverage_chr1 >= 190 & binned_coverage_chr1 <= 920]
+
+# Mean and sd for normal region
+mu_normal <- mean(normal_region)
+sd_normal <- sd(normal_region)
+
+# Plot histogram of normal-like region only
+hist(normal_region,
+     breaks = 50,
+     probability = TRUE,
+     col = "skyblue",
+     border = "white",
+     main = "Zoomed- in Histogram of Normal-Like Coverage Region",
+     xlab = "Coverage (reads per bin)",
+     ylim = c(0, 0.003))
+
+# Add fitted normal curve
+curve(dnorm(x, mean = mu_normal, sd = sd_normal),
+      col = "darkred",
+      lwd = 2,
+      add = TRUE)
+
+# Legend
+legend("topright",
+       legend = paste0("N(μ = ", round(mu_normal, 1), ", σ = ", round(sd_normal, 1), ")"),
+       col = "darkred",
+       lwd = 2,
+       bty = "n")
+```
+
+
+To explore whether a portion of the coverage distribution follows a normal shape, we focused on a restricted interval between 190 and 920 reads per bin—visually the region with the least skewness. Within this range, the histogram exhibits an approximately symmetric, bell-shaped distribution, and the fitted normal curve
+(with μ = 509.4 and σ = 148.1) aligns well with the overall trend of the data.
+
+However, even in this more "normal-like" subregion, there are subtle deviations: the left tail rises more steeply than expected under normality, and the right side of the distribution remains slightly heavier. These imperfections suggest that while the normal model provides a useful local approximation, inference procedures relying on strict normality assumptions should be applied with caution.
+
+
+###  Assessing the Fit to a Normal Distribution
+
+To check how well our data follows a normal distribution, we created a QQ plot that compares the observed values to what we’d expect if the data came from a normal distribution with the same mean and standard deviation.
+
+```{r}
+# QQ plot for the normal-like region
+qqnorm(normal_region,
+       main = "QQ Plot of Coverage (190–920 reads/bin)",
+       col = "darkblue",
+       pch = 19,
+       cex = 0.6)
+qqline(normal_region, col = "red", lwd = 2, lty = 2)
+
+```
+
+### Interpretation of the QQ Plot (190–920 coverage range)
+
+The QQ plot shows that most of the points follow the red reference line fairly well, especially in the center of the distribution. This indicates that the central part of the coverage values (between 190 and 920 reads per bin) behaves approximately like a normal distribution.
+
+However, we can see deviations at both tails:
+- On the **left side** (low coverage values), there’s a slight flattening, suggesting a heavier left tail than expected under normality.
+- On the **right side** (high coverage), the curve bends above the line, indicating a right-skew or light upper tail truncation.
+
+### Conclusion
+Although it's not a perfect normal distribution, this middle range of the data  **reasonably approximates a normal distribution**, which justifies using it for downstream statistical assumptions like z-scores or IQR-based outlier detection.
+
+### To Summary:
+One key thing we learned is how much bin size and data transformations (like log scale) can change the way we see patterns in the data. A dense region can look flat or sharp depending on the scale, so choosing the right visualization really matters. This helped us better detect outliers and understand coverage distribution across genomic regions.
+
+
+
+

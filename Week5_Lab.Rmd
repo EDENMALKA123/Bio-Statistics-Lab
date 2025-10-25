@@ -1,0 +1,1253 @@
+---
+title: "HW4"
+author: "Omer Abuhatzira, Eden Malka, Salome Baranes"
+date: "2025-05-02"
+output:
+  html_document: default
+  word_document: default
+---
+
+Group members:
+
+ - Omer Abuhazira 319119988 omer.abuhatzira@mail.huji.ac.il
+ - Eden Malka 318849940 eden.malka@mail.huji.ac.il
+ - Salome Baranes 209891183 salome.baranes@mail.huji.ac.il
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Libraries used
+
+```{r libraries, message=FALSE, warning=FALSE, results='hide'}
+# Load necessary libraries
+library(data.table)
+library(ggplot2)
+library(splines)
+library(dplyr)
+library(tidyr)
+library(caret)
+library(gridExtra)
+library(knitr)
+library(kableExtra)
+library(pheatmap)
+
+
+```
+
+
+### Paths and Data - Data Preparation
+
+```{r paths, message=FALSE, warning=FALSE}
+library(data.table)
+
+# The read mapping file (from last week's lab)
+reads_file <- "C:/Users/97250/Downloads/TCGA-13-0723-01A_lib1_all_chr1.forward"
+chr1_reads <- fread(reads_file)
+colnames(chr1_reads) <- c("Chrom", "Loc", "FragLen")
+
+# Load and concatenate the full chromosome 1 sequence from 5 parts
+load_rda_string <- function(path) {
+  obj_name <- load(path)
+  get(obj_name)
+}
+
+# Load each .rda file
+s1 <- load_rda_string("C:/Users/97250/Downloads/chr1_str_0M_50M.rda")
+s2 <- load_rda_string("C:/Users/97250/Downloads/chr1_str_50M_100M.rda")
+s3 <- load_rda_string("C:/Users/97250/Downloads/chr1_str_100M_150M.rda")
+s4 <- load_rda_string("C:/Users/97250/Downloads/chr1_str_150M_200M.rda")
+s5 <- load_rda_string("C:/Users/97250/Downloads/chr1_str_200M_end.rda")
+
+# Concatenate to get the full chr1 sequence as a single character string
+chr1_seq <- paste0(s1, s2, s3, s4, s5)
+
+# Split into individual bases (A, C, G, T)
+chr1_full <- strsplit(chr1_seq, "")[[1]]
+
+# Check length (should be ~250 million)
+length(chr1_full)
+
+```
+
+### Introduction
+
+In this lab, we focus on understanding the relationship between GC content and sequencing coverage. Throughout the analysis, we try different regression models and check how well they explain the coverage based on GC. We also test whether this relationship stays consistent across different regions of the chromosome and under different bin sizes. Along the way, we build functions to make our workflow cleaner and easier to reuse, and we use both plots and summary metrics to compare model performance.
+
+
+### Before We Begin – Outlier Filtering from our last lab:
+
+### first Filtering
+
+
+```{r, message=FALSE, warning=FALSE}
+library(data.table)
+library(ggplot2)
+
+# Define bin size
+bin_size <- 10000
+n_bins <- ceiling(length(chr1_full) / bin_size)
+
+# Calculate coverage (number of reads per bin)
+bin_breaks <- c(seq(0, length(chr1_full) + bin_size, by = bin_size))
+coverage <- hist(chr1_reads$Loc, breaks = bin_breaks, plot = FALSE)$counts
+
+# Prepare dataframe
+df <- data.frame(
+  Bin = seq_along(coverage),
+  Coverage = coverage
+)
+
+# Smooth coverage using LOESS
+smoothed_line <- loess(Coverage ~ Bin, data = df, span = 0.05)
+df$Smoothed <- predict(smoothed_line)
+
+# Calculate residuals
+df$Residual <- df$Coverage - df$Smoothed
+
+# Calculate IQR from residuals
+Q1 <- quantile(df$Residual, 0.25)
+Q3 <- quantile(df$Residual, 0.75)
+IQR_val <- Q3 - Q1
+
+upper_threshold <- Q3 + 1.5 * IQR_val
+lower_threshold <- Q1 - 1.5 * IQR_val
+
+# Define upper and lower outliers
+df$OutlierType <- "None"
+df$OutlierType[df$Residual > upper_threshold] <- "Above LOESS"
+df$OutlierType[df$Residual < lower_threshold] <- "Below LOESS"
+
+# Create clean dataset without outliers and low coverage for further use
+df_clean <- df[df$OutlierType == "None" & df$Coverage >= 5, ]
+
+
+```
+
+### Second filtering + Ploting + Cubic SPline:
+
+
+```{r, message=FALSE, warning=FALSE}
+library(splines)
+library(dplyr)
+library(ggplot2)
+
+# GC Content per bin
+GC_per_bin <- numeric(n_bins)
+for (i in 1:n_bins) {
+  bin <- chr1_full[((i - 1) * bin_size + 1):(i * bin_size)]
+  GC_per_bin[i] <- sum(bin %in% c("G", "C")) / bin_size
+}
+
+# Create df_model with Coverage + GC_Content
+df_model <- data.frame(
+  Bin = seq_along(coverage),
+  Coverage = coverage,
+  GC_Content = GC_per_bin
+)
+
+# Compute LOESS and prediction
+loess_fit <- loess(Coverage ~ GC_Content, data = df_model, span = 0.5)
+df_model$LOESS_Fit <- predict(loess_fit)
+
+# Filter GC_Content >= 0.2
+df_model <- df_model %>% filter(GC_Content >= 0.3)
+
+# Remove outliers using IQR method
+df_model$Residual <- df_model$Coverage - df_model$LOESS_Fit
+iqr_val <- IQR(df_model$Residual, na.rm = TRUE)
+q1 <- quantile(df_model$Residual, 0.25, na.rm = TRUE)
+q3 <- quantile(df_model$Residual, 0.75, na.rm = TRUE)
+lower_bound <- q1 - 3.25 * iqr_val
+upper_bound <- q3 + 3.25 * iqr_val
+
+df_clean <- df_model %>%
+  filter(Residual >= lower_bound, Residual <= upper_bound)
+
+# Additional filter: remove top 1% most extreme residuals
+abs_res <- abs(df_clean$Residual)
+threshold_1pct <- quantile(abs_res, 0.98)
+df_clean <- df_clean %>% filter(abs(Residual) <= threshold_1pct)
+
+# Define 5 knots explicitly
+knots_gc <- quantile(df_clean$GC_Content, probs = seq(0.2, 0.8, length.out = 5))
+
+# Final spline fit with 5 knots
+fit <- lm(Coverage ~ bs(GC_Content, knots = knots_gc, degree = 3), data = df_clean)
+df_clean$Cubic_Fit <- predict(fit)
+mae <- round(mean(abs(df_clean$Coverage - df_clean$Cubic_Fit)), 2)
+
+# Identify removed points
+removed_pts <- anti_join(df_model, df_clean, by = c("GC_Content", "Coverage"))
+
+# Calculate percentage of removed points
+pct_removed <- round(100 * nrow(removed_pts) / (nrow(removed_pts) + nrow(df_clean)), 1)
+label_text <- paste0(pct_removed, "% of points removed")
+
+# Plot with knots
+ggplot() +
+  geom_point(data = df_model, aes(x = GC_Content, y = Coverage),
+             color = "lightgrey", alpha = 0.2, size = 1) +
+  geom_point(data = removed_pts, aes(x = GC_Content, y = Coverage),
+             color = "black", alpha = 0.6, size = 1) +
+  geom_point(data = df_clean, aes(x = GC_Content, y = Coverage, color = GC_Content),
+             alpha = 0.5, size = 1) +
+  geom_line(data = df_clean, aes(x = GC_Content, y = Cubic_Fit),
+            linetype = "dashed", color = "black", size = 1.2) +
+  geom_vline(xintercept = knots_gc, linetype = "dashed", color = "gray30") +
+  annotate("text", x = 0.6, y = 950, label = label_text, hjust = 0, size = 3) +
+  scale_color_gradient(low = "blue", high = "red", name = "GC %") +
+  labs(
+    title = "Coverage vs GC Content – Relative to LOESS Band",
+    subtitle = paste("Cubic Spline with 5 Knots, MAE =", mae),
+    x = "GC Content",
+    y = "Total Reads per Bin"
+  ) +
+  coord_cartesian(xlim = c(0.3, 0.7), ylim = c(0, 1000)) +
+  theme_minimal()
+
+# Cleaned data plot
+ggplot(df_clean, aes(x = GC_Content, y = Coverage)) +
+  geom_point(aes(color = GC_Content), alpha = 0.5, size = 1) +
+  geom_line(aes(y = Cubic_Fit), linetype = "dashed", color = "black", size = 1.2) +
+  geom_vline(xintercept = knots_gc, linetype = "dashed", color = "gray30") +
+  annotate("text", x = 0.6, y = 950, label = label_text, hjust = 0, size = 3) +
+  scale_color_gradient(low = "blue", high = "red", name = "GC %") +
+  labs(
+    title = "Coverage vs GC Content – Cleaned Data Only",
+    subtitle = paste("Cubic Spline with 5 Knots, MAE =", mae),
+    x = "GC Content",
+    y = "Total Reads per Bin"
+  ) +
+  coord_cartesian(xlim = c(0.3, 0.7), ylim = c(0, 1000)) +
+  theme_minimal()
+
+```
+
+### Outlier Filtering and Model Fitting interpetation:
+
+In the first step, we calculated sequencing coverage across 10,000bp bins and applied a LOESS smoothing function to capture the general trend in coverage along the chromosome. We then computed the residuals and removed bins whose residuals were outside the range defined by **Q1 − 1.5 × IQR** and **Q3 + 1.5 × IQR**. Additionally, bins with very low coverage (less than 5 reads) were filtered out.
+
+In the second step, we refined the filtering process to better capture the relationship between GC content and sequencing coverage. First, we excluded bins with low GC values, keeping only those with GC content above 0.3. Then, we fitted a LOESS model to the data and calculated the residuals. We used the IQR method again, but this time with a wider range (**±3.25 × IQR**) to filter out more extreme points that don’t follow the LOESS trend well.
+
+Additionally, based on visual inspection, we noticed that a few extreme points still remained and distorted the fit. To address this, we removed the top 2% most extreme residuals. Now we can start.
+
+
+### Part a - Train/Test Split and Detecting Overfitting
+
+Before diving into training the model on different sample sizes, we wanted to first get a clear picture of how the model performs when trained on the full training data (80%) and tested on a separate test set (20%). We used a stratified split based on GC content to make sure the GC distribution stays similar in both sets. Then, we fit our original cubic spline model (with the same fixed knots as before) on the training data, and compared its predictions to the actual coverage values in both train and test sets.
+
+
+```{r, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(splines)
+
+set.seed(123)
+
+# Split data into Train/Test 
+
+# Create GC bins for stratified sampling
+df_clean <- df_clean %>%
+  mutate(GC_Bin = cut(GC_Content, breaks = seq(0.2, 0.7, by = 0.05), include.lowest = TRUE))
+
+# Perform stratified split based on GC distribution
+train_index <- createDataPartition(df_clean$GC_Bin, p = 0.8, list = FALSE)
+
+train_data <- df_clean[train_index, ]
+test_data <- df_clean[-train_index, ]
+
+cat("Train size:", nrow(train_data), "(80%)\n")
+cat("Test size:", nrow(test_data), "(20%)\n")
+
+# Fit spline model on Train data
+
+fit_train <- lm(Coverage ~ bs(GC_Content, knots = knots_gc, degree = 3), data = train_data)
+
+# Predict on Train data
+train_data$Predicted <- predict(fit_train, newdata = train_data)
+
+# Predict on Test data 
+
+test_data$Predicted <- predict(fit_train, newdata = test_data)
+
+# Calculate MAE 
+
+mae_train <- mean(abs(train_data$Coverage - train_data$Predicted))
+mae_test <- mean(abs(test_data$Coverage - test_data$Predicted))
+
+# Display MAE results
+mae_results <- data.frame(
+  Set = c("Train", "Test"),
+  MAE = c(mae_train, mae_test)
+)
+
+print(mae_results)
+
+library(dplyr)
+library(ggplot2)
+library(gridExtra)
+
+# Calculate RMSE 
+rmse_train <- sqrt(mean((train_data$Coverage - train_data$Predicted)^2))
+rmse_test <- sqrt(mean((test_data$Coverage - test_data$Predicted)^2))
+
+# Plot for Train 
+p_train <- ggplot(train_data, aes(x = GC_Content, y = Coverage)) +
+  geom_point(alpha = 0.3, color = "blue") +
+  geom_line(aes(y = Predicted), color = "red", size = 1.2) +
+  labs(
+    title = paste("Train Set: Observed vs Predicted Coverage"),
+    subtitle = paste("RMSE =", round(rmse_train, 2), "| MAE =", round(mae_train, 2)),
+    x = "GC Content",
+    y = "Coverage",
+    color = "Legend"
+  ) +
+  theme_minimal()
+
+# Plot for Test 
+p_test <- ggplot(test_data, aes(x = GC_Content, y = Coverage)) +
+  geom_point(alpha = 0.3, color = "blue") +
+  geom_line(aes(y = Predicted), color = "red", size = 1.2) +
+  labs(
+    title = paste("Test Set: Observed vs Predicted Coverage"),
+    subtitle = paste("RMSE =", round(rmse_test, 2), "| MAE =", round(mae_test, 2)),
+    x = "GC Content",
+    y = "Coverage",
+    color = "Legend"
+  ) +
+  theme_minimal()
+
+# Show both plots together 
+gridExtra::grid.arrange(p_train, p_test, ncol = 1)
+
+```
+
+
+### Interpretation of Results
+
+The two plots show the observed versus predicted coverage for both the training and test sets. The red curve in both plots represents the same cubic spline model we fit earlier using the training data only. Visually, the model seems to capture the main trend of the data quite well in both sets, with a similar shape and no major discrepancies. The RMSE and MAE values are also very close between train and test, which suggests that the model generalizes well and is not overfitting at this point. This result gives us confidence to move forward and test how model performance behaves as we reduce the training size.
+
+### Visualizing GC Content Distribution After Train/Test Split
+
+To make sure our train-test split is fair, we visualized the GC content distribution in both sets. Since the model is sensitive to GC content, it’s important that the distribution remains consistent across the split.
+
+
+```{r, message=FALSE, warning=FALSE}
+ggplot(df_clean, aes(x = GC_Content)) +
+  geom_histogram(data = train_data, aes(fill = "Train"), alpha = 0.5, binwidth = 0.01) +
+  geom_histogram(data = test_data, aes(fill = "Test"), alpha = 0.5, binwidth = 0.01) +
+  labs(title = "GC Content Distribution - Train (Blue) vs Test (Red)",
+       x = "GC Content",
+       y = "Count",
+       fill = "Dataset") +
+  scale_fill_manual(values = c("Train" = "blue", "Test" = "red")) +
+  theme_minimal()
+
+```
+
+
+### Interpetation
+
+The histogram confirms that the GC content is distributed similarly in both the training set (blue) and the test set (red). While the test set has fewer observations, the overall shape and spread of GC values is consistent.
+
+
+### Investigating Overfitting by Varying Training Sample Size
+
+To address the question of overfitting, we simulated how the model behaves when trained on varying sample sizes. Specifically, we drew multiple random subsets of different sizes from the original training set (ranging from 3% to 90%) and evaluated the model’s Mean Absolute Error (MAE) Gap between the the training and test sets, along with its standard deviation. Our goal is to see when overfitting tends to occur.
+
+
+```{r ,message=FALSE, warning=FALSE}
+library(caret)
+library(ggplot2)
+library(dplyr)
+
+set.seed(123)
+
+# proportions include small sizes
+proportions <- c(0.03, 0.05, 0.075, 0.10, seq(0.15, 0.9, by = 0.05))
+n_train <- nrow(train_data)
+n_simulations <- 100
+
+results <- data.frame()
+
+for (p in proportions) {
+  mae_gaps <- numeric(n_simulations)
+  
+  for (i in 1:n_simulations) {
+    sub_indices <- sample(seq_len(n_train), size = floor(p * n_train))
+    sub_train <- train_data[sub_indices, ]
+    
+    model <- lm(Coverage ~ bs(GC_Content, knots = knots_gc, degree = 3), data = sub_train)
+    
+    mae_train <- mean(abs(sub_train$Coverage - predict(model, newdata = sub_train)))
+    mae_test  <- mean(abs(test_data$Coverage - predict(model, newdata = test_data)))
+    
+    mae_gaps[i] <- mae_test - mae_train
+  }
+  
+  results <- rbind(results, data.frame(
+    Train_Percent = round(p * 100, 2),
+    Sample_Size = floor(p * n_train),
+    MAE_Gap_Mean = mean(mae_gaps),
+    MAE_Gap_SD = sd(mae_gaps)
+  ))
+}
+
+# Improved axis breaks for readability
+ggplot(results, aes(x = Train_Percent, y = MAE_Gap_Mean)) +
+  geom_line(color = "purple", size = 1.2) +
+  geom_point(size = 2, color = "purple") +
+  geom_errorbar(aes(ymin = MAE_Gap_Mean - MAE_Gap_SD,
+                    ymax = MAE_Gap_Mean + MAE_Gap_SD),
+                width = 1.5, color = "purple") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_x_continuous(
+    breaks = seq(0, 100, by = 10),
+    name = "Training Sample Size (%)",
+    sec.axis = dup_axis(
+      trans = ~ round(. / 100 * n_train),
+      breaks = round(seq(0, 100, by = 10) / 100 * n_train),
+      name = "Training Sample Size (Count)"
+    )
+  ) +
+  labs(
+    title = "Average MAE Gap (Test - Train) Across 100 Simulations",
+    y = "MAE Gap ± Standard Deviation",
+    caption = "Purple error bars represent ±1 SD across simulations"
+  ) +
+  theme_minimal(base_size = 14)
+
+```
+
+### Overfitting Analysis Based on Training Set Percentage
+
+### At What Train Size Does Overfitting Begin?
+
+The graph shows the average MAE gap (Test - Train) for different training set sizes. At very small sample sizes (3%–5%), the model tends to overfit the training data, as indicated by a positive MAE gap — meaning the test error is significantly higher than the training error. This is accompanied by large standard deviations, showing that model performance is unstable in such small samples.
+
+As the training set size increases beyond approximately 7.5%–10% (around 1700 examples), the MAE gap becomes negative and stabilizes - the model generalizes well to the test set. The gap remains consistently close to zero or slightly negative as the training size continues to grow, and the error bars become narrower, indicating more reliable and consistent behavior.
+
+In conclusion, there appears to be a tendency toward overfitting in training sets smaller than ~7.5%, This happens because small training sets don’t capture the full variability of the data, so the model ends up fitting noise instead of learning the true pattern.
+
+### Part b - Comparing Coverage Models: G vs. C vs. G+C
+
+To better understand what drives coverage, we fit three separate cubic spline models using the same modeling approach we’ve used so far: one model based on G content, one on C content, and one using the combined G+C content. All models were fitted using 5 knots based on the quantiles of the predictor variable and the same cleaned dataset to ensure a fair comparison. This allowed us to assess which predictor provides a better explanation of the variation in coverage, based on both R² and MAE metrics.
+
+
+```{r,  message=FALSE, warning=FALSE}
+df_gc <- df_clean
+
+# Add G and C columns by counting bases from chr1_full per bin
+df_gc$G <- NA
+df_gc$C <- NA
+
+for (i in seq_len(nrow(df_gc))) {
+  bin_index <- df_gc$Bin[i]
+  bin_bases <- chr1_full[((bin_index - 1) * bin_size + 1):(bin_index * bin_size)]
+  
+  df_gc$G[i] <- sum(bin_bases == "G") / bin_size
+  df_gc$C[i] <- sum(bin_bases == "C") / bin_size
+}
+
+# Define knots for each predictor
+knots_g   <- quantile(df_gc$G, probs = seq(0.2, 0.8, length.out = 5))
+knots_c   <- quantile(df_gc$C, probs = seq(0.2, 0.8, length.out = 5))
+knots_gc  <- quantile(df_gc$G + df_gc$C, probs = seq(0.2, 0.8, length.out = 5))
+
+# Fit cubic spline models
+fit_g_spline  <- lm(Coverage ~ bs(G,        knots = knots_g,  degree = 3), data = df_gc)
+fit_c_spline  <- lm(Coverage ~ bs(C,        knots = knots_c,  degree = 3), data = df_gc)
+fit_gc_spline <- lm(Coverage ~ bs(G + C,    knots = knots_gc, degree = 3), data = df_gc)
+
+# Predict values
+df_gc$Pred_G   <- predict(fit_g_spline)
+df_gc$Pred_C   <- predict(fit_c_spline)
+df_gc$Pred_GC  <- predict(fit_gc_spline)
+
+# Calculate metrics
+r2_g   <- round(summary(fit_g_spline)$r.squared, 3)
+r2_c   <- round(summary(fit_c_spline)$r.squared, 3)
+r2_gc  <- round(summary(fit_gc_spline)$r.squared, 3)
+
+mae_g  <- round(mean(abs(df_gc$Coverage - df_gc$Pred_G)), 2)
+mae_c  <- round(mean(abs(df_gc$Coverage - df_gc$Pred_C)), 2)
+mae_gc <- round(mean(abs(df_gc$Coverage - df_gc$Pred_GC)), 2)
+
+# Plotting function
+plot_spline_model <- function(x_vals, pred_vals, label, color, r2, mae) {
+  df_plot <- data.frame(
+    x = x_vals,
+    y = df_gc$Coverage,
+    yhat = pred_vals
+  )
+  
+  ggplot(df_plot, aes(x = x, y = y)) +
+    geom_point(alpha = 0.3, color = color, size = 1.2) +
+    geom_line(aes(y = yhat), color = "black", linewidth = 0.8) +
+    coord_cartesian(ylim = c(0, 1000)) +
+    labs(
+      title = paste("Coverage vs.", label),
+      x = paste(label, "Proportion"),
+      y = "Coverage"
+    ) +
+    annotate("text", x = max(x_vals, na.rm = TRUE) * 0.95, y = 950,
+             label = paste0("R² = ", r2), hjust = 1, size = 4.5) +
+    annotate("text", x = max(x_vals, na.rm = TRUE) * 0.95, y = 880,
+             label = paste0("MAE = ", mae), hjust = 1, size = 4.5) +
+    theme_minimal(base_size = 18)
+}
+
+# Generate plots
+plot_spline_model(df_gc$G + df_gc$C, df_gc$Pred_GC, "G+C Content", "darkgreen", r2_gc, mae_gc)
+plot_spline_model(df_gc$G, df_gc$Pred_G, "G Content", "blue", r2_g, mae_g)
+plot_spline_model(df_gc$C, df_gc$Pred_C, "C Content", "red", r2_c, mae_c)
+
+
+```
+
+
+
+#### Comparative Analysis: Coverage vs. G+C, G, and C Content
+
+
+When comparing the three models, the G+C content clearly provides the best fit to the data. It achieves the highest R² value (**0.921**) and the lowest MAE (**35.0**), indicating that it explains more variance in coverage and provides more accurate predictions. In contrast, the G content model (R² = **0.813**, MAE = **56.1**) and the C content model (R² = **0.812**, MAE = **56.3**) perform similarly to one another but are noticeably less effective than the combined G+C model. 
+
+Additionally, the scatter plots for G and C show more dispersion around the fitted curve, suggesting greater variability and weaker model fit when using each base separately. 
+
+This suggests that coverage is better explained by the total GC content rather than the individual contributions of G or C alone. 
+
+#### MAE Gap (Test - Train) by Sample Size and cubic spline 
+
+In this section, we explore how the choice of predictor (G, C, or G+C) impacts model performance across different training sample sizes. For each predictor, we repeatedly fit a cubic spline model with 5 knots, using manually defined knot positions based on quantiles. We test sample sizes of 500, 1000, 2000, and 4000, and for each size we run 100 simulations where the data is split into 80% training and 20% testing. 
+
+In each simulation, we calculate the mean absolute error (MAE) for both the train and test sets and compute the gap between them (Test MAE - Train MAE). 
+
+
+```{r, fig.width=10, fig.height=6,  message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(splines)
+
+set.seed(42)
+
+# Sample sizes and simulations
+sample_sizes <- c(500, 1000, 2000, 4000)
+n_simulations <- 100
+
+# Define knots once — use df_gc which includes G and C
+knots_gc <- quantile(df_gc$G + df_gc$C, probs = seq(0.2, 0.8, length.out = 5))
+knots_g  <- quantile(df_gc$G, probs = seq(0.2, 0.8, length.out = 5))
+knots_c  <- quantile(df_gc$C, probs = seq(0.2, 0.8, length.out = 5))
+
+# Store results
+results <- data.frame()
+
+for (predictor in c("GC", "G", "C")) {
+  for (size in sample_sizes) {
+    mae_gaps <- numeric(n_simulations)
+    
+    for (i in 1:n_simulations) {
+      df_sample <- df_gc %>% sample_n(size)  # sample from df_gc, not df_clean
+      train_index <- createDataPartition(df_sample$Coverage, p = 0.8, list = FALSE)
+      train_data <- df_sample[train_index, ]
+      test_data  <- df_sample[-train_index, ]
+      
+      # Choose model
+      if (predictor == "GC") {
+        model <- lm(Coverage ~ bs(G + C, knots = knots_gc, degree = 3), data = train_data)
+      } else if (predictor == "G") {
+        model <- lm(Coverage ~ bs(G, knots = knots_g, degree = 3), data = train_data)
+      } else {
+        model <- lm(Coverage ~ bs(C, knots = knots_c, degree = 3), data = train_data)
+      }
+      
+      train_pred <- predict(model, newdata = train_data)
+      test_pred  <- predict(model, newdata = test_data)
+      
+      mae_train <- mean(abs(train_data$Coverage - train_pred))
+      mae_test  <- mean(abs(test_data$Coverage - test_pred))
+      mae_gaps[i] <- mae_test - mae_train
+    }
+    
+    results <- rbind(results, data.frame(
+      Predictor = predictor,
+      SampleSize = size,
+      MAE_Gap_Mean = mean(mae_gaps),
+      MAE_Gap_SD = sd(mae_gaps)
+    ))
+  }
+}
+
+# Improved plot with dodged error bars
+dodge <- position_dodge(width = 200)
+
+ggplot(results, aes(x = SampleSize, y = MAE_Gap_Mean, color = Predictor)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = MAE_Gap_Mean - MAE_Gap_SD,
+                    ymax = MAE_Gap_Mean + MAE_Gap_SD),
+                width = 200) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_x_continuous(breaks = sample_sizes) +
+  labs(
+    title = "MAE Gap (Test - Train) by Sample Size\n(Cubic Spline with 5 Knots)",
+    subtitle = "Cubic Spline (color shows model, error bars = ± SD)",
+    x = "Training Sample Size",
+    y = "MAE Gap ± SD",
+    color = "Cubic Spline"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "top")
+
+
+
+
+```
+
+#### Interpretation: MAE Gap (Test - Train) by Sample Size and Cubic Spline
+
+The plot shows the MAE gap between test and train sets for each predictor across increasing sample sizes. At smaller sample sizes (500 and 1000), the G predictor shows a large positive gap, suggesting strong overfitting — the model fits the training data well but generalizes poorly. As the sample size grows, the gap narrows and even becomes slightly negative at 2000, indicating potential underfitting. The GC predictor performs more consistently, with a relatively small gap across all sample sizes, indicating better generalizability. The C predictor maintains a moderate and stable gap, but performs slightly worse than GC. Overall, the GC model demonstrates the most balanced performance with less overfitting, especially as sample size increases.
+
+
+### Summary
+
+The plot shows that the GC predictor consistently has the smallest MAE gap and the lowest standard deviation across all training sample sizes, suggesting it generalizes better than the individual G or C predictors. At small sample sizes (e.g., 500 and 1000), the variability is much higher for all predictors, but especially for G and C.
+
+As the sample size increases, the MAE gap narrows for all predictors, but GC remains the most stable and balanced. This supports our earlier finding that combining G and C provides a more reliable estimate of coverage, especially when data is limited.
+
+
+
+
+```{r, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyr)
+library(kableExtra)
+
+# Table of MAE gaps by predictor and sample size
+mae_gap_table <- results %>%
+  select(Predictor, SampleSize, MAE_Gap_Mean) %>%
+  pivot_wider(names_from = Predictor, values_from = MAE_Gap_Mean, names_prefix = "MAE_Gap_") %>%
+  rename(
+    `MAE Gap (GC)` = MAE_Gap_GC,
+    `MAE Gap (G)` = MAE_Gap_G,
+    `MAE Gap (C)` = MAE_Gap_C
+  )
+
+# Display formatted table
+mae_gap_table %>%
+  kable(caption = "Average MAE Gap (Test - Train) by Predictor and Sample Size",
+        align = 'c', format = "html") %>%
+  kable_styling(full_width = FALSE, position = "center")
+
+```
+
+
+ 
+#### Interpretation: Train and Test MAE Gap by Predictor and Sample Size
+
+The table shows the average MAE gap (Test MAE - Train MAE) across different predictors and training sample sizes. A positive gap suggests overfitting (better performance on train than test), while a negative gap may indicate underfitting or good generalization.
+
+For small sample sizes (e.g., 500), the G predictor shows the largest overfitting with a gap of ~1.4, while the GC predictor shows a smaller gap (~0.86), and C shows almost no gap. As the sample size increases, the gaps for all predictors shrink toward zero, showing improved generalization.
+
+### Summary: Is G+C Content a Better Predictor?
+
+Yes — across all sample sizes, the G+C model shows the most balanced performance. It maintains the lowest and most stable MAE gap, especially as training size increases. 
+
+
+### Part c
+
+
+### Cross-Region Generalization: Can One GC-Coverage Model Fit All? 
+
+In this section, we investigate whether the relationship between GC content and sequencing coverage is consistent across different regions of the chromosome. To do this, we divided the chromosome into **five equal-sized regions** based on the number of genomic bins. Each region contains approximately the same number of bins, ensuring that the comparison is balanced and not biased by region size.
+
+### MAE heatmap
+
+To visualize how well models trained in one region perform across all regions, we use the following MAE heatmap to highlight the differences in prediction accuracy between region pairs.
+
+
+```{r, message=FALSE, warning=FALSE}
+# Ensure chromosome is divided into 5 regions 
+df_clean$Region <- cut(df_clean$Bin, breaks = 5, labels = paste0("Region_", 1:5))
+
+# Create a table of MAE results for all region combinations
+region_ids <- sort(unique(df_clean$Region))
+region_cv_results <- data.frame()
+
+for (train_region in region_ids) {
+  for (test_region in region_ids) {
+    
+    # Filter training and testing data for each region
+    train_data <- df_clean %>% filter(Region == train_region)
+    test_data  <- df_clean %>% filter(Region == test_region)
+    
+    # Fit spline model only on the training region
+    model <- lm(Coverage ~ bs(GC_Content, knots = knots_gc, degree = 3), data = train_data)
+    
+    # Predict coverage on the test region
+    preds <- predict(model, newdata = test_data)
+    
+    # Calculate Mean Absolute Error (MAE) on the test data
+    mae <- round(mean(abs(test_data$Coverage - preds)), 2)
+    
+    # Store results in a combined data frame
+    region_cv_results <- rbind(region_cv_results, data.frame(
+      TrainRegion = train_region,
+      TestRegion = test_region,
+      MAE = mae
+    ))
+  }
+}
+
+# Plot heatmap of MAE values 
+region_cv_results$highlight <- region_cv_results$TestRegion == "Region_2"
+
+# Plot with black border for Region_2 test row
+# Plot the heatmap normally
+ggplot(region_cv_results, aes(x = TrainRegion, y = TestRegion, fill = MAE)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = MAE), size = 5, color = "black") +
+  scale_fill_gradient(low = "lightblue", high = "red") +
+
+  # Add full black rectangle manually around the row of Region_2
+  geom_rect(
+    data = NULL,
+    aes(xmin = 0.5, xmax = 5.5, ymin = which(levels(region_ids) == "Region_2") - 0.5, 
+        ymax = which(levels(region_ids) == "Region_2") + 0.5),
+    color = "black",
+    fill = NA,
+    linewidth = 1.5
+  ) +
+
+  labs(
+    title = "MAE of Coverage Predictions Between Chromosome Regions",
+    x = "Training Region",
+    y = "Testing Region",
+    fill = "MAE"
+  ) +
+  theme_minimal(base_size = 14)
+
+```
+
+
+
+### Interpretation of the Full Cross-Region MAE Matrix
+
+The heatmap shows the Mean Absolute Error (MAE) values for every pair of training and testing regions. Each cell represents how well a model trained on one region predicts coverage in another. Lighter cells indicate better prediction performance, while darker red cells highlight regions that are harder to model accurately.
+
+#### Region 2 – Easiest Region to Predict
+Region 2 shows the **lowest overall MAE values** across all training models (between **31.33** and **33.41**). This suggests that Region 2 has a relatively stable and predictable GC-coverage relationship, making it the easiest region to generalize into.
+
+**Conclusion**: the relationship between GC content and coverage is not identical across all regions, so it's better to fit separate models for each region rather than using a single global function.
+
+### MAE GAP Plot:
+
+```{r,  message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+
+# Create region pairs and compute gap
+mae_gap_df <- region_cv_results %>%
+  group_by(TrainRegion, TestRegion) %>%
+  summarize(MAE = mean(MAE), .groups = "drop") %>%
+  group_by(TrainRegion) %>%
+  mutate(Train_MAE = MAE[TestRegion == TrainRegion]) %>%
+  ungroup() %>%
+  filter(TestRegion != TrainRegion) %>%
+  mutate(MAE_Gap = MAE - Train_MAE)
+
+# Plot with legend on top
+ggplot(mae_gap_df, aes(x = TestRegion, y = MAE_Gap, group = TrainRegion, color = TrainRegion)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    title = "MAE Gap (Test - Train) by Region Pair",
+    x = "Test Region",
+    y = "MAE Gap",
+    color = "Train Region"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "top")
+
+```
+
+
+
+### Interpretation
+
+The graph presents the **MAE gaps** between test and train performance for each region pair.  
+A **positive gap** indicates that the model performs **worse on the test region** compared to the region it was trained on, whereas a **negative gap** implies the model actually performed **better on the test region** than on its own training data.
+
+From the plot, we can see that:
+- Models trained on **Region 2** tend to have **consistently small MAE gaps**, especially when predicting **Regions 3, 4, and 5**, suggesting good generalizability.
+- In contrast, training on **Region 1** or **Region 3** leads to **larger negative gaps** when predicting Region 2 — meaning the model fits its own region less effectively.
+- **Region 5** also yields modest gaps across most test regions, indicating balanced performance.
+
+We noticed that this graph is **dense and complex**, so to make the interpretation clearer, we decided to **zoom in on Region 2** because  **Region 2** is the strongest candidate for training — it provides good prediction accuracy across other regions with **minimal degradation in test performance**.
+
+
+### Cross-Region Generalization - Train: Region 2
+
+After comparing all region pairs, we now focus specifically on **Region 2** as a training region. Region 2 was chosen because it showed the lowest average MAE across test regions in the full matrix, indicating strong generalizability.
+
+Here, we train a spline regression model using only data from Region 2 and evaluate how well it predicts coverage in each of the other regions.
+
+This focused analysis helps us better understand the strengths and limitations of Region 2 as a basis for modeling coverage across the chromosome.
+
+
+```{r, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(splines)
+
+# Divide chromosome into 5 regions by bin
+n_regions <- 5
+df_clean$Region <- cut(df_clean$Bin, breaks = n_regions, labels = paste0("Region_", 1:n_regions))
+
+# Choose one training region
+train_region <- "Region_2"
+train_data <- df_clean %>% filter(Region == train_region)
+
+# Fit model on train region
+model <- lm(Coverage ~ bs(GC_Content, df = 5), data = train_data)
+train_data$Predicted <- predict(model, newdata = train_data)
+
+# Loop over all test regions and generate a plot for each
+unique_regions <- levels(df_clean$Region)
+
+for (test_region in unique_regions) {
+  
+  # Skip if it's the same as the training region
+  if (test_region == train_region) next
+  
+  # Select test region
+  test_data <- df_clean %>% filter(Region == test_region)
+  test_data$Predicted <- predict(model, newdata = test_data)
+  
+  # Combine data
+  plot_df <- bind_rows(
+    train_data %>% mutate(Source = paste0("Train (", train_region, ")")),
+    test_data %>% mutate(Source = paste0("Test (", test_region, ")"))
+  )
+  
+  # Calculate metrics
+  mae_train <- mean(abs(train_data$Coverage - train_data$Predicted))
+  mae_test  <- mean(abs(test_data$Coverage - test_data$Predicted))
+  r2_train <- round(summary(lm(train_data$Coverage ~ train_data$Predicted))$r.squared, 3)
+  r2_test  <- round(summary(lm(test_data$Coverage ~ test_data$Predicted))$r.squared, 3)
+  
+  # Plot
+  p <- ggplot(plot_df, aes(x = GC_Content, y = Coverage, color = Source)) +
+    geom_point(alpha = 0.3, size = 1.2) +
+    geom_line(aes(y = Predicted), size = 1.1) +
+    scale_color_manual(values = c("blue", "red")) +
+    coord_cartesian(ylim = c(0, 1000)) +
+    labs(
+      title = paste("Train:", train_region, "| Test:", test_region),
+      subtitle = paste("Train R² =", r2_train, "MAE =", round(mae_train, 2),
+                       "| Test R² =", r2_test, "MAE =", round(mae_test, 2)),
+      x = "GC Content",
+      y = "Coverage"
+    ) +
+    theme_minimal(base_size = 14)
+  
+  print(p)  # Display the plot for this region
+}
+```
+
+
+
+### Interprtation of the results (Train: Region_2)
+
+In general, the values reported for **MAE** and **R²** are based on the **test sets**, meaning they reflect the model’s ability to generalize to unseen data.  
+A **lower MAE** means the model made **smaller average prediction errors**, while a **higher R²** means the model explained a **larger proportion of the variance**.
+
+- In **Region 1**, the model performed the worst, with the largest MAE (**41.18**) and the lowest R² (**0.847**). The prediction curve diverges from the test data, especially at higher GC values, suggesting that Region 1 has a slightly different GC-coverage pattern.
+
+- In **Region 3**, the model fits better, with **R² = 0.900** and **MAE = 35.48**. The predicted curve tracks the test data more closely, indicating moderate similarity to the training region.
+
+- **Region 4** shows the best fit overall. The prediction curve aligns very well with the test points, resulting in **R² = 0.925** and a low **MAE = 32.80**. This suggests a strong structural similarity between Region 2 and Region 4.
+
+- **Region 5** also performs well, with **R² = 0.894** and **MAE = 34.83**. The predicted curve follows the true test pattern closely across the GC range, showing that Region 2 captures the overall behavior here effectively.
+
+**Conclusion**:  
+The results show that the relationship between GC content and coverage is not exactly the same in all regions of the chromosome. Since the model trained on Region 2 worked very well in some regions (like Region 4 and 5) but not in others (especially Region 1), we can’t fully rely on one single function for the whole chromosome.
+
+**So, it’s better to fit separate models for each region**, especially if we want more accurate predictions. A global model might be okay for general trends, but for high accuracy, region-specific models are the better choice.
+
+### Quantitative Evaluation of Model Performance Using MAE and R²
+
+After visually examining how well a model trained on Region 2 generalizes to other parts of the chromosome, we now turn to a more quantitative evaluation. In this section, we use two common performance metrics — **MAE (Mean Absolute Error)** and **R² (Coefficient of Determination)** — to assess the model’s accuracy across different regions. These metrics help us confirm and strengthen the conclusions drawn from the plots by providing a clearer numerical comparison of model fit in each region.
+
+
+```{r, message=FALSE, warning=FALSE}
+# Load required libraries ----
+library(ggplot2)
+library(dplyr)
+library(pheatmap)
+
+# Create summary table with MAE and R² results
+# These are based on a model trained on Region_2 and tested on other regions
+summary_table <- data.frame(
+  Region     = c("Region_1", "Region_3", "Region_4", "Region_5"),
+  Train_R2   = rep(0.863, 4),                   # R² for training region (constant)
+  Train_MAE  = rep(34.16, 4),                   # MAE for training region (constant)
+  Test_R2    = c(0.802, 0.844, 0.904, 0.864),   # R² for each test region
+  Test_MAE   = c(46.63, 42.52, 35.76, 37.5)     # MAE for each test region
+)
+
+# Print the full summary table 
+print(summary_table)
+
+# Extract only MAE columns and convert to matrix for heatmap
+mae_matrix <- as.matrix(summary_table[, c("Train_MAE", "Test_MAE")])
+rownames(mae_matrix) <- summary_table$Region
+
+# Plot heatmap of MAE values
+# This shows prediction errors across regions using a color scale
+pheatmap(
+  mae_matrix,
+  color = colorRampPalette(c("white", "lightpink", "red3"))(100),  # color scale
+  display_numbers = TRUE,       # show actual MAE values inside cells
+  cluster_rows = FALSE,         # keep row order (Region_1 → Region_5)
+  cluster_cols = FALSE,         # keep column order (Train/Test)
+  main = "MAE (Train/Test) by Region – Model Trained on Region_2",
+  fontsize = 12,
+  angle_col = 45                # rotate column labels
+)
+
+# Create a data frame of MAE gaps
+mae_gap_df <- summary_table %>%
+  mutate(MAE_Gap = Test_MAE - Train_MAE)
+
+# Plot MAE Gap per test region
+ggplot(mae_gap_df, aes(x = Region, y = MAE_Gap, fill = Region)) +
+  geom_col(width = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    title = "MAE Gap (Test - Train) for Each Region (Model Trained on Region_2)",
+    x = "Test Region",
+    y = "MAE Gap"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")
+```
+
+
+
+### Analysis: Quantitative Evaluation of Model Performance Using MAE and R²
+
+#### Table Overview
+
+The table presents the **R²** and **MAE** values for both the training and testing sets:
+
+- Since the model was trained only on Region_2, the **Train R² (0.863)** and **Train MAE (34.16)** are identical for all rows.  
+- The **Test R²** values range from **0.802 to 0.904**, and the **Test MAE** values range from **35.76 to 46.63**.  
+- Region_1 has the **highest test error** (MAE = **46.63**, R² = **0.802**), which means the model trained on Region_2 struggles to predict this region accurately.  
+- Region_4 has the **lowest test error** (MAE = **35.76**, R² = **0.904**), suggesting the relationship between GC content and coverage is more similar between Region_2 and Region_4.
+
+#### Heatmap Interpretation
+
+The heatmap visualizes the **MAE** values from the table using a red color scale — **darker red indicates higher error**. This gives a quick way to see which test regions performed better or worse:
+
+- Region_1 stands out with a dark red cell, confirming it is the most difficult region for the model to predict.  
+- Region_3, Region_4, and Region_5 are lighter, showing **lower prediction errors** and therefore better generalization.  
+- All training MAEs are light since they are constant across regions.
+
+### MAE GAP Plot:
+
+As we saw, the MAE gap plot clearly shows that a model trained on Region 2 generalizes much better to Regions 4 and 5 (with small MAE gaps) than to Region 1.
+
+#### Conclusion
+
+This analysis shows that a model trained on one region doesn't always perform equally well on other regions. While it generalizes fairly well to Region_4 and Region_5, the performance drops significantly in Region_1. This suggests that the **relationship between GC content and coverage may vary across the chromosome**, and in some cases, it might be better to **fit region-specific models** rather than assume a single function fits all areas.
+
+
+### Localized Modeling Approach
+
+In this section, we explore whether the relationship between **GC content** and **sequencing coverage** is consistent throughout the chromosome or varies across regions.  
+Unlike the previous method, where a model was trained on **Region 2** and evaluated on the other regions, here we apply a **localized approach**:  
+We split the chromosome into **five distinct regions**, and within **each region**, we perform a separate **train/test split** and fit an **independent spline model**.  
+
+This method helps assess whether it’s more appropriate to use a **single global model** or to model **each region individually**, allowing us to capture potential **local variability** in the GC-coverage relationship.
+
+
+```{r, message=FALSE, warning=FALSE, fig.width=12, fig.height=8}
+library(ggplot2)
+library(splines)
+library(caret)
+library(gridExtra)
+
+set.seed(123)
+plots <- list()
+
+# Loop over regions
+for (r in sort(unique(df_clean$Region))) {
+  
+  # Subset data for region
+  region_data <- df_clean %>% filter(Region == r)
+  
+  # Train/test split
+  train_index <- createDataPartition(region_data$Coverage, p = 0.8, list = FALSE)
+  train_data <- region_data[train_index, ]
+  test_data  <- region_data[-train_index, ]
+  
+  # Fit spline model on train
+  model <- lm(Coverage ~ bs(GC_Content, df = 5), data = train_data)
+  
+  # Predictions
+  train_data$Predicted <- predict(model, newdata = train_data)
+  test_data$Predicted <- predict(model, newdata = test_data)
+  
+  # MAE and R²
+  mae_test <- round(mean(abs(test_data$Coverage - test_data$Predicted)), 2)
+  r2_test <- round(summary(model)$r.squared, 3)
+  
+  # Combine data
+  train_data$Set <- "Train"
+  test_data$Set <- "Test"
+  region_combined <- rbind(train_data, test_data)
+  
+  # Plot
+  p <- ggplot(region_combined, aes(x = GC_Content, y = Coverage, color = Set)) +
+    geom_point(alpha = 0.3, size = 1) +
+    geom_line(data = train_data, aes(x = GC_Content, y = Predicted), color = "red", size = 1.2) +
+    scale_color_manual(values = c("Train" = "blue", "Test" = "green")) +
+    labs(
+      title = paste("Region", r, "- Coverage vs. GC Content"),
+      x = "GC Content",
+      y = "Coverage",
+      color = "Set"
+    ) +
+    annotate("text", x = min(region_data$GC_Content, na.rm = TRUE), y = max(region_data$Coverage, na.rm = TRUE),
+             label = paste0("R² = ", r2_test, "\nMAE = ", mae_test),
+             hjust = 0, vjust = 1, size = 5) +
+    theme_minimal(base_size = 14)
+  
+  plots[[r]] <- p
+}
+
+# Display all plots
+do.call(grid.arrange, c(plots, ncol = 2))
+
+```
+
+
+### Interpretation of Results
+
+The plots show that the relationship between **GC content** and **coverage** tends to follow a **curved, non-linear pattern** in all regions — usually rising with GC content and then tapering off.  
+
+- **Region 2** and **Region 4** show the **best model performance**, with **R² values above 0.89** and **low MAE** (Region_2: R² = 0.893, MAE = 31.02; Region_4: R² = 0.927, MAE = 33.2), meaning the model explains the data well and has small prediction errors.  
+- **Region 3** and **Region 5** also perform well, with **R² values of 0.899 and 0.897**, respectively, and relatively **low MAE values (~35–36)**. This suggests a strong and reliable pattern, but slightly less optimal than Regions 2 and 4.  
+- In contrast, **Region 1** has the **lowest R² (0.851)** and **highest MAE (41.44)**, indicating weaker predictive accuracy and more variability in the data.
+
+These results indicate that the GC-coverage relationship is **not completely consistent** across the chromosome.  
+Some regions show **stronger and clearer patterns**, while others are more **noisy or irregular**.  
+
+This supports the idea that **fitting a separate model for each region** can better capture local trends and reduce prediction errors, rather than assuming a single model fits the entire chromosome.
+
+
+### Part D: Exploring the Optimal Bin Size for Modeling the GC-Coverage Relationship
+
+In this section, we aim to determine whether the strength of the relationship between GC content and sequencing coverage depends on the choice of bin size. While previous analyses used a fixed bin size, here we compare several bin sizes (e.g., 1,000; 2,000; and 10,000 base pairs) to investigate which one captures the GC bias most clearly.
+
+To fairly compare models trained using different bin sizes, we follow the approach : although each model is trained using a different bin size (e.g., 1,000bp, 2,000bp, etc.), the evaluation is done on a fixed resolution — for example, 10,000bp bins.
+
+This ensures that all models are compared based on their ability to predict coverage at the same genomic scale, avoiding misleading results that may arise from having different numbers of training points or noise levels. By keeping the evaluation bins constant, we get a clearer picture of which bin size produces the most informative and generalizable GC-coverage model.
+
+
+
+```{r,  message=FALSE, warning=FALSE}
+# Define bin sizes to test — all must be multiples of 10,000 (the resolution of df_clean)
+bin_sizes <- c(10000, 20000, 40000, 50000)
+
+# Create an empty dataframe to store model predictions for all bin sizes
+all_model_data <- data.frame()
+
+# Loop through each bin size and fit a spline model
+for (size in bin_sizes) {
+  
+  bin_ratio <- size / 10000  # Assuming df_clean is based on 10,000bp bins
+  
+  # Aggregate the original bins to match the desired bin size
+  df_agg <- df_clean %>%
+    mutate(Aggregated_Bin = floor((Bin - 1) / bin_ratio) + 1) %>%
+    group_by(Aggregated_Bin) %>%
+    summarise(
+      Coverage = mean(Coverage),
+      GC_Content = mean(GC_Content),
+      .groups = "drop"
+    ) %>%
+    filter(Coverage > 0, GC_Content >= 0.2, GC_Content <= 0.7)
+  
+  # Fit a cubic spline regression model
+  model <- lm(Coverage ~ bs(GC_Content, df = 5), data = df_agg)
+  
+  # Add predictions and bin size as columns
+  df_agg$Predicted <- predict(model, newdata = df_agg)
+  df_agg$Bin_Size <- size
+  
+  # Combine into full dataset for visualization
+  all_model_data <- rbind(all_model_data, df_agg)
+}
+# Load required libraries
+library(dplyr)
+library(ggplot2)
+library(splines)
+
+# Initialize results table
+results <- data.frame(
+  Bin_Size = integer(),
+  R2 = numeric(),
+  MAE = numeric()
+)
+
+# Loop over bin sizes
+for (size in bin_sizes) {
+  
+  bin_ratio <- size / 10000  # original bins are 10,000 bp
+  
+  # Aggregate bins from df_clean using bin_ratio
+  df_agg <- df_clean %>%
+    mutate(Aggregated_Bin = floor((Bin - 1) / bin_ratio) + 1) %>%
+    group_by(Aggregated_Bin) %>%
+    summarise(
+      Coverage = mean(Coverage),
+      GC_Content = mean(GC_Content),
+      .groups = "drop"
+    ) %>%
+    filter(Coverage > 0, GC_Content >= 0.2, GC_Content <= 0.7)
+  
+  # Fit spline model on aggregated data
+  model <- lm(Coverage ~ bs(GC_Content, df = 5), data = df_agg)
+  predictions <- predict(model, newdata = df_agg)
+  
+  # Evaluate model
+  r2 <- round(summary(model)$r.squared, 4)
+  mae <- round(mean(abs(df_agg$Coverage - predictions)), 2)
+  
+  results <- rbind(results, data.frame(
+    Bin_Size = size,
+    R2 = r2,
+    MAE = mae
+  ))
+}
+
+# Plot MAE vs Bin Size
+ggplot(results, aes(x = Bin_Size, y = MAE)) +
+  geom_line(color = "red", size = 1.2) +
+  geom_point(size = 3, color = "red") +
+  labs(
+    title = "MAE vs Bin Size",
+    x = "Bin Size (bp)",
+    y = "Mean Absolute Error"
+  ) +
+  theme_minimal(base_size = 14)
+
+# Plot R² vs Bin Size
+ggplot(results, aes(x = Bin_Size, y = R2)) +
+  geom_line(color = "darkgreen", size = 1.2) +
+  geom_point(size = 3, color = "darkgreen") +
+  labs(
+    title = "Explained Variance (R²) vs Bin Size",
+    x = "Bin Size (bp)",
+    y = "R²"
+  ) +
+  theme_minimal(base_size = 14)
+
+library(ggplot2)
+library(dplyr)
+
+# Add annotation labels for R² and MAE per bin size
+label_data <- all_model_data %>%
+  group_by(Bin_Size) %>%
+  summarise(
+    R2 = round(cor(Coverage, Predicted)^2, 3),
+    MAE = round(mean(abs(Coverage - Predicted)), 2),
+    x = max(GC_Content, na.rm = TRUE),
+    y = max(Coverage, na.rm = TRUE)
+  ) %>%
+  mutate(label = paste0("R² = ", R2, "\nMAE = ", MAE))
+
+
+# View the summarized results table
+print(results)
+
+
+```
+
+
+### Analysis Summary – Effect of Bin Size on GC-Coverage Relationship
+
+In this analysis, we investigated how the relationship between GC content and sequencing coverage varies with different bin sizes (10,000 to 50,000 bp). For each bin size, we aggregated the cleaned data, fitted a cubic spline regression model, and computed two key metrics:  
+- **R² (explained variance)**: how much of the variation in coverage is explained by GC content.  
+- **MAE (mean absolute error)**: the average prediction error of the model.
+
+The results clearly indicate that **as bin size increases, both model accuracy and explanatory power improve**:
+- The **MAE consistently decreases**, dropping from **35.04** at 10kb to **21.81** at 50kb.  
+- The **R² steadily increases**, from **0.9211** to **0.9606**, indicating a stronger and more stable association between GC content and coverage in larger bins.
+
+This behavior makes intuitive sense: larger bins reduce local noise and reveal broader patterns, allowing the GC-coverage relationship to emerge more clearly. In contrast, smaller bins are more susceptible to variability from local artifacts, which weakens the signal.
+
+**Conclusion**: The GC-coverage relationship becomes stronger and more predictive at larger bin sizes. For robust modeling and normalization, bins of **40,000–50,000 bp** yield the most consistent results.
+
+### Visualizing GC-Coverage Patterns Across Bin Sizes
+
+```{r,  message=FALSE, warning=FALSE}
+# Plot: GC Content vs Coverage with spline prediction by bin size
+ggplot(all_model_data, aes(x = GC_Content, y = Coverage)) +
+  
+  # Add the original coverage points as light gray dots
+  geom_point(alpha = 0.3, color = "gray", size = 1) +
+  
+  # Add the spline prediction line in blue with a legend label
+  geom_line(aes(y = Predicted, color = "Fitted Spline"), size = 1) +
+  
+  # Create separate panels for each bin size, arranged in two columns
+  facet_wrap(~ Bin_Size, scales = "free", ncol = 2) +
+  
+  # Define plot titles and axis labels
+  labs(
+    title = "GC Content vs. Coverage Across Different Bin Sizes",
+    subtitle = "With Cubic Spline Fit for Each Bin Size",
+    x = "GC Content",
+    y = "Coverage",
+    color = "Legend"
+  ) +
+  
+  # Define manual color for the fitted line
+  scale_color_manual(values = c("Fitted Spline" = "blue")) +
+  
+  # Apply a minimal theme for clean appearance
+  theme_minimal(base_size = 15) +
+  
+  # Customize the theme: move legend to top, bold facet titles and plot titles
+  theme(
+    legend.position = "top",
+    strip.text = element_text(size = 14, face = "bold"),
+    plot.title = element_text(face = "bold", size = 18, hjust = 0.5),
+    plot.subtitle = element_text(size = 14, hjust = 0.5)
+  )
+
+
+```
+
+
+### Visual Interpretation of Spline Fits
+
+
+The plots confirm what we saw in the numeric results: **larger bins produce smoother and more stable fits**, with less noise and clearer trends.  
+This supports the conclusion that **larger bin sizes (like 40,000 or 50,000 bp)** better capture the underlying GC bias in sequencing coverage.
+
+### Lab Summary – Modeling GC Bias in Sequencing Coverage
+
+In this lab, we explored how GC content affects sequencing coverage across chromosome 1. We started by cleaning the data to remove extreme outliers, using residuals from a LOESS fit to capture and exclude unusual coverage patterns. Then, we used spline regression models to study the non-linear relationship between GC content and coverage, both within single regions and across different parts of the chromosome. We also tested whether G and C separately explain coverage as well as their combined effect.
+
+Finally, we analyzed how different bin sizes impact the clarity and stability of the GC-coverage relationship, comparing model performance at several resolutions. Throughout the lab, we used both visualizations and numeric metrics like R² and MAE to compare models and evaluate their accuracy.
+
+**One thing We've learned**: The size of the genomic bins we use can make a big difference — larger bins reduce noise and help reveal clearer patterns in the data.

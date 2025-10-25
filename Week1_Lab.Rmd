@@ -1,0 +1,579 @@
+---
+title: "HW1"
+author: "Eden Malka, Salome Baranes, Omer Abuhazira "
+date: "8 April 2025"
+output:
+  html_document:
+    code_folding: show
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+Group members:
+
+ - Eden Malka 318849940  
+ - Salome Baranes 209891183
+ - Omer Abuhazira 319119988 
+
+```{r}
+# Disable warnings
+options(warn = -1)
+
+```
+
+### Libraries used
+
+```{r libraries}
+library(ggplot2)
+library(kableExtra)
+
+```
+
+### Paths and Data
+
+```{r paths}
+str1_path = "C:/Users/97250/Downloads"
+
+```
+
+## Introduction 
+
+This week’s assignment is all about diving into DNA sequence data and exploring how the four bases (A, C, G, T) behave across a specific region of chromosome 1. We’ll focus on Group B, which spans from 30 to 50 million base pairs, and use various tools in R to analyze base frequencies, look at how different bases relate to each other, and identify outlier regions that stand out from the rest. The goal is to better understand patterns in the genome and possibly spot areas that could be biologically interesting.
+
+
+### Question (a) – Loading and Summarizing Genomic Region (Group B)
+
+In this step, we load a pre-extracted DNA sequence from the human reference genome (chromosome 1, build hg18), specifically for Group B, which spans base positions 30,000,000 to 49,999,999 (a 20 million base segment).
+
+The sequence is initially stored as a single long character string and is then converted into a vector of individual nucleotide letters (`A`, `C`, `G`, `T`). 
+
+Then, we compute the total count of each base and divide the region into bins of 1,000 bases, allowing us to calculate base frequencies within each bin. We summarize the results both numerically (in millions) and visually using a colored barplot, providing an informative overview of the sequence composition.
+
+
+
+```{r part1, fig.width=5, fig.height=5}
+library(kableExtra)
+
+dir_path = "C:/Users/97250/Downloads"
+
+load(file.path(dir_path, "chr1_str_30M_50M.rda"))  # loads chr1_str_30M_50M
+
+# Convert character strings to vectors of individual bases
+group_b_line = strsplit(chr1_str_30M_50M, "")[[1]]
+
+table(group_b_line)
+
+base_colors <- c("A" = "#00008b", 
+                       "T" = "#add8e6",   
+                       "C" = "#006400",   
+                       "G" = "#90ee90")   
+
+# Function to count base frequencies per bin
+count_bases_per_bin <- function(base_vector, bin_size = 1000) {
+  N = length(base_vector)
+  n_bins = ceiling(N / bin_size)
+  base_types = c("A", "C", "G", "T")
+  base_counts = matrix(0, nrow = n_bins, ncol = length(base_types))
+  colnames(base_counts) = base_types
+  
+  for (i in 1:n_bins) {
+    start = (i - 1) * bin_size + 1
+    end = min(i * bin_size, N)
+    bin = base_vector[start:end]
+    bin_table = table(factor(bin, levels = base_types))
+    base_counts[i, ] = as.numeric(bin_table)
+  }
+  
+  return(base_counts)
+}
+
+# Apply to Group B
+base_counts_group_b <- count_bases_per_bin(group_b_line, bin_size = 1000)
+
+# Total base counts
+total_b <- colSums(base_counts_group_b)
+
+# Convert to millions, round and sort
+total_b_m <- sort(round(total_b / 1e6, 2), decreasing = TRUE)
+
+# Display as table with custom width
+knitr::kable(as.data.frame(total_b_m),
+             col.names = c("Base", "Count (millions)"),
+             caption = "Group B – Total Base Counts (in millions)") %>%
+  kable_styling("striped", full_width = F, position = "center") %>%
+  column_spec(1, width = "3cm") %>%
+  column_spec(2, width = "3cm")
+
+plot_base_bar <- function(counts, title = "") {
+  barplot(counts,
+          col = base_colors[names(counts)],
+          ylab = "Count (millions)",
+          main = title,
+          cex.names = 1.2,
+          las = 1)
+}
+
+# Barplot
+plot_base_bar(total_b_m, "Group B")
+
+```
+
+#### Observations:
+
+
+The total base counts in this region show that A and T bases appear more frequently (5.49 million and 5.45 million, respectively), compared to C and G (4.54 million and 4.52 million).
+
+This pattern suggests that the region is relatively AT-rich, which is biologically meaningful. AT-rich regions are often associated with specific structural or functional properties in DNA, such as lower binding stability (A-T pairs form only two hydrogen bonds, compared to three in G-C pairs) or specific regulatory functions.
+
+### Question (b) – Base Counts in Fixed-Size Bins
+
+To analyze the base composition across the region, we wrote a function called `count_bases_per_bin()` that takes a vector of base letters (A, T, C, G) and splits it into fixed-size bins (1,000 bases per bin). For each bin, the function counts how many times each base appears, returning a data frame where each row corresponds to a bin and each column to a specific base.
+
+This allows us to observe how the base distribution changes along the chromosome in a structured and quantifiable way.
+
+
+```{r base_plots, fig.width=6, fig.height=12}
+# Function: count base frequencies per bin
+count_bases_per_bin <- function(base_vector, bin_size = 1000) {
+  N <- length(base_vector)
+  n_bins <- ceiling(N / bin_size)
+  base_types <- c("A", "C", "G", "T")
+  base_counts <- matrix(0, nrow = n_bins, ncol = length(base_types))
+  colnames(base_counts) <- base_types
+  rownames(base_counts) <- paste0("bin_", 1:n_bins)
+  
+  for (i in 1:n_bins) {
+    start <- (i - 1) * bin_size + 1
+    end <- min(i * bin_size, N)
+    bin <- base_vector[start:end]
+    
+    bin_table <- table(factor(bin, levels = base_types))
+    base_counts[i, ] <- as.numeric(bin_table)
+  }
+  
+  return(as.data.frame(base_counts))
+}
+
+# Apply to Group B (defined earlier as group_b_line)
+base_counts_group_b <- count_bases_per_bin(group_b_line, bin_size = 1000)
+
+# Show the first 6 bins as example
+head(base_counts_group_b)
+
+
+```
+#### Observations:
+
+As we can see, we presented a table with the count of each base. There are 20,000 rows, so we chose to display the first few rows of the table to get an intuition about the data.
+
+
+### Question (c) – Histograms of Base Distributions 
+
+In this step, we examine the distribution of each DNA base (A, C, G, T) by plotting histograms of their counts per 1,000-base bins.  
+We overlay each histogram with both an empirical density curve and a theoretical normal distribution to visually assess how closely the observed data follows a normal distribution.  
+Additionally, we mark the mean and standard deviation for each base, providing insight into variability and potential skewness in their distributions.
+
+
+```{r part3, fig.width=8, fig.height=15}
+base_colors <- c(
+  "A" = "blue",   
+  "T" = "#add8e6",   
+  "C" = "#006400",   
+  "G" = "#90ee90"    
+)
+
+# Set layout
+par(mfrow = c(4, 1), mar = c(4, 4, 3, 2))  # increase right margin for clarity
+
+# Axis limits
+x_limits <- range(unlist(base_counts_group_b))
+y_limits <- c(0, 0.015)
+
+base_names <- colnames(base_counts_group_b)
+
+for (base in base_names) {
+  base_counts <- base_counts_group_b[[base]]
+  mean_val <- mean(base_counts)
+  sd_val <- sd(base_counts)
+
+  # Histogram
+  hist(base_counts,
+       breaks = 30,
+       main = paste(" Histogram of Base", base),
+       xlab = paste(base, "per 1,000 bp"),
+       col = base_colors[base],
+       border = "white",
+       freq = FALSE,
+       xlim = x_limits,
+       ylim = y_limits,
+       axes = FALSE)
+
+  # Axes
+  axis(1, at = seq(x_limits[1], x_limits[2], by = 50))
+  axis(2, at = seq(0, y_limits[2], by = 0.005))
+  box()
+
+  # Empirical density
+  lines(density(base_counts), col = "black", lwd = 2.5)
+
+  # Normal distribution
+  xfit <- seq(min(base_counts), max(base_counts), length = 100)
+  yfit <- dnorm(xfit, mean = mean_val, sd = sd_val)
+  lines(xfit, yfit, col = "red", lty = 2, lwd = 1.5)
+
+  # Vertical line at mean
+  abline(v = mean_val, col = "purple", lty = 3, lwd = 2)
+
+  # Legend
+  legend("topright",
+         legend = c("Empirical Density", "Normal Distribution", "Mean"),
+         col = c("black", "red", "purple"),
+         lty = c(1, 2, 3),
+         lwd = c(2.5, 1.5, 2),
+         bty = "n",
+         cex = 1.2)
+
+  # Add mean and SD text 
+  text(x = x_limits[2] - 100,
+       y = y_limits[2] - 0.004,
+       labels = paste0("Mean = ", round(mean_val, 1),
+                       ", SD = ", round(sd_val, 1)),
+       cex = 1.1,
+       col = "black")
+}
+
+
+```
+
+
+###  Interpretation 
+
+The histograms for all four DNA bases (A, T, C, G) show approximately bell-shaped distributions, indicating that base counts per 1,000 base pairs tend to follow a near-normal pattern. Bases **A** and **T** have higher mean values (~274 and ~273), while **C** and **G** are slightly lower (~227 and ~226), reflecting their overall abundance in the sequence.
+
+We observe that the distributions for **A** and **T** show slight **right-skewness** (longer right tails), suggesting that a small number of bins have unusually high counts of these bases — possibly pointing to regions with base enrichment. On the other hand, **C** and **G** show more **symmetric** distributions.
+
+
+### Question (d) – Base Frequencies by Chromosomal Location
+
+we visualize the frequency of each DNA base. The region is divided into 1,000-base bins, and we plot the base frequencies along the chromosome, with the x-axis representing chromosomal positions in megabases (Mb) and the y-axis showing the frequency per bin.
+
+While this initial visualization helped us see how base frequency fluctuates, the plots were quite noisy and made it difficult to compare patterns—especially between biologically related bases- A–T and C–G.
+
+Additionally, we added a horizontal reference line at 0.25 to better compare the base frequencies with the expected uniform distribution, aiding in the visualization of regions with significant deviations from the baseline.
+
+To improve clarity, we applied a **smoothing function** (moving average over a window of 50 bins). This technique averages the values across neighboring bins, reducing short-term fluctuations and emphasizing underlying patterns. After smoothing, it became much easier to spot similarities between **complementary base pairs**.
+
+Finally, we plotted **A vs T** and **C vs G** together, which visually confirmed their strong resemblance.
+
+```{r part4, fig.width=10, fig.height=5}
+base_colors <- c(
+  "A" = "#00008b",   
+  "T" = "#add8e6",   
+  "C" = "#006400",  
+  "G" = "#90ee90"    
+)
+
+# Bin positions for Group B (starts at 30 million)
+bin_size = 1000
+n_bins_b = nrow(base_counts_group_b)
+positions_b = seq_len(n_bins_b) * bin_size + 30e6 - bin_size  # real genomic positions
+
+# Plot all 4 bases – one above the other
+par(mfrow = c(4, 1), mar = c(4, 4, 2, 2))
+
+for (base in c("A", "T", "C", "G")) {
+  freq = base_counts_group_b[, base] / bin_size
+  
+  plot(positions_b / 1e6, freq, type = "l",  # X in millions
+       col = base_colors[base],
+       lwd = 1.5,
+       xlab = "Chromosomal Position (Mb)",
+       ylab = "Frequency",
+       main = paste("Frequency of Base", base))
+  
+  # Add horizontal reference line at 0.25
+  abline(h = 0.25,
+         lty = 2,
+         col = ifelse(base %in% c("A", "T"), "red", "red"),
+         lwd = ifelse(base %in% c("A", "T"), 1.5, 2))
+}
+
+
+# Define moving average function
+moving_average <- function(x, window = 50) {
+  stats::filter(x, rep(1 / window, window), sides = 2)
+}
+
+# Positions (in millions)
+bin_size <- 1000
+n_bins_b <- nrow(base_counts_group_b)
+positions_b <- seq_len(n_bins_b) * bin_size + 30e6 - bin_size
+positions_b_mb <- positions_b / 1e6
+
+# Plot smoothed frequency curves
+par(mfrow = c(4, 1), mar = c(4, 4, 2, 2))
+
+for (base in c("A", "T", "C", "G")) {
+  freq <- base_counts_group_b[, base] / bin_size
+  smoothed <- moving_average(freq, window = 50)
+  
+  plot(positions_b_mb, smoothed, type = "l",
+       col = base_colors[base],
+       lwd = 2,
+       xlab = "Chromosomal Position (Mb)",
+       ylab = "Smoothed Frequency",
+       main = paste("Smoothed Frequency – Base", base))
+  
+  abline(h = 0.25,
+         lty = 2,
+         col = ifelse(base %in% c("A", "T"), "red", "red"),
+         lwd = ifelse(base %in% c("A", "T"), 1.5, 2))
+}
+
+# Moving average function
+moving_average <- function(x, window = 50) {
+  stats::filter(x, rep(1 / window, window), sides = 2)
+}
+
+# Bin positions in Mb
+bin_size <- 1000
+n_bins <- nrow(base_counts_group_b)
+positions_mb <- (seq_len(n_bins) * bin_size + 30e6 - bin_size) / 1e6
+
+# Calculate smoothed frequencies
+smoothed <- lapply(colnames(base_counts_group_b), function(base) {
+  freq <- base_counts_group_b[, base] / bin_size
+  moving_average(freq)
+})
+names(smoothed) <- colnames(base_counts_group_b)
+
+# Plot A and T together
+par(mfrow = c(2, 1), mar = c(4, 4, 2, 2))
+
+plot(positions_mb, smoothed$A, type = "l", lwd = 2,
+     col = base_colors["A"],
+     ylim = c(0.15, 0.4),
+     xlab = "Chromosomal Position (Mb)",
+     ylab = "Smoothed Frequency",
+     main = "Smoothed Frequencies – Bases A and T")
+lines(positions_mb, smoothed$T, col = base_colors["T"], lwd = 2)
+legend("topleft", legend = c("A", "T"),
+       col = base_colors[c("A", "T")], lwd = 2, bty = "n")
+
+# Add horizontal line at 0.25
+abline(h = 0.25, lty = 2, col = "red", lwd = 1.5)
+
+# Plot C and G together
+plot(positions_mb, smoothed$C, type = "l", lwd = 2,
+     col = base_colors["C"],
+     ylim = c(0.15, 0.4),
+     xlab = "Chromosomal Position (Mb)",
+     ylab = "Smoothed Frequency",
+     main = "Smoothed Frequencies – Bases C and G")
+lines(positions_mb, smoothed$G, col = base_colors["G"], lwd = 2)
+legend("topleft", legend = c("C", "G"),
+       col = base_colors[c("C", "G")], lwd = 2, bty = "n")
+
+# Add horizontal line at 0.25
+abline(h = 0.25, lty = 2, col = "red", lwd = 2)
+
+
+```
+
+#### Conclusions:
+
+By applying a rolling average to the base frequencies, we were able to observe clearer and more interpretable trends across the chromosome. Bases **A** and **T** exhibit very similar patterns, consistently hovering just **above the empirical mean** of 0.25 (the red line), and often rising and falling in unison. This visual similarity supports their **complementary pairing** in the DNA double helix and highlights that this region is relatively **AT-rich**. On the other hand, **C** and **G** also show coordinated trends, although with slightly more variability, and generally remain **below 0.25**, often dipping in regions where A and T peak. The smoothed frequency plots, anchored by the horizontal reference line at 0.25, allow us to easily compare each base’s frequency against an expected uniform distribution. These patterns suggest **structural or functional differences** along the genome, especially in regions where base frequencies deviate significantly from the 0.25 baseline.
+
+### Question 1(e) – Scatter Plots of Base Frequencies
+
+We examine the relationships between all pairs of bases by plotting scatter plots of their frequencies across all bins and compare them pairwise: 
+A-T, A-C, A-G, T-C, T-G, and C-G.
+We highlighted in red the outlier points that are more than 4 standard deviations from the mean.
+
+
+```{r, fig.width=10, fig.height=15}
+
+
+base_colors <- "#00008b"
+highlight_color <- "#ff4500"  # Color for outlier points
+
+# Get all base pairs from raw counts
+base_pairs <- combn(colnames(base_counts_group_b), 2, simplify = FALSE)
+
+# Set layout for 6 plots (3 rows, 2 columns)
+par(mfrow = c(3, 2), mar = c(5, 5, 3, 2))  
+
+# Convert to frequencies (divide all values by 1000)
+base_freqs_group_b <- base_counts_group_b / 1000
+
+# Calculate global x and y limits for all frequency values
+x_limits <- range(base_freqs_group_b, na.rm = TRUE)
+y_limits <- x_limits  # for square aspect across all plots
+
+# Loop through each pair
+for (pair in base_pairs) {
+  x <- base_freqs_group_b[, pair[1]] 
+  y <- base_freqs_group_b[, pair[2]] 
+  
+  # Compute the mean and standard deviation for both x and y
+  mean_x <- mean(x, na.rm = TRUE)
+  sd_x <- sd(x, na.rm = TRUE)
+  mean_y <- mean(y, na.rm = TRUE)
+  sd_y <- sd(y, na.rm = TRUE)
+  
+  # Compute the correlation
+  correlation <- cor(x, y, use = "complete.obs")
+  
+  # Identify outliers (points that are more than 4 standard deviations from the mean)
+  outlier_x <- abs(x - mean_x) > 4 * sd_x  
+  outlier_y <- abs(y - mean_y) > 4 * sd_y 
+  
+# Highlight outliers in a different color
+  plot(x, y,
+       xlim = x_limits,
+       ylim = y_limits,
+       col = ifelse(outlier_x | outlier_y, highlight_color, adjustcolor(base_colors, alpha.f = 0.5)),
+       pch = 16,
+       cex = ifelse(outlier_x | outlier_y, 1.2, 0.8),  
+       xlab = paste(pair[1], "Frequency"),
+       ylab = paste(pair[2], "Frequency"),
+       main = paste(pair[1], "vs", pair[2]),
+       cex.lab = 1.8,  
+       cex.axis = 1,  
+       cex.main = 2)  
+  
+  # Add correlation in the top right
+  usr <- par("usr")
+  text(x = usr[2] - 0.01,
+       y = usr[4] - 0.01,
+       labels = paste("r =", round(correlation, 2)),
+       adj = c(1, 1),
+       cex = 2,  
+       font = 2)
+  
+  # Add regression line
+  abline(lm(y ~ x), col = "red", lty = 2, lwd = 2)
+  
+  grid()
+}
+
+
+
+
+```
+
+###  a. Interpretation - looking at the trend:
+
+The scatter plots show that A vs C and A vs G have strong negative correlations (r = -0.66 and r = -0.42), indicating that when A is more frequent, C and G tend to decrease, reflecting the AT-rich nature of the region. Similarly, C vs T (r = -0.39) and G vs T (r = -0.64) further suggest competition between AT-rich and GC-rich regions.
+
+C vs G shows a weak positive correlation (r = 0.26), as both are part of the GC pair. A vs T has a very weak negative correlation (r = -0.11), which is unexpected given their biological complementary. As we saw in the previous section, the smoothed frequency plot of A and T illustrates a weak negative correlation: when A increases, T tends to decrease.
+
+However, both A and T rise and fall together above the empirical line of uniform distribution, suggesting some coordinated variation. 
+
+Overall, these patterns highlight the inverse relationship between AT-rich and GC-rich regions across the chromosome.
+
+
+### b. Are there any groups of points that stand out?
+
+Looking at the scatter plots for all base pairs, we can see that there are several outliers scattered across the plots.
+
+For example, in the A vs C and A vs G plots, there are some bins where A is much higher than C or G, which is typical for AT-rich regions. However, there are also points that stand out from the main pattern. Similarly, in the C vs G and C vs T plots, there are outliers where C is much higher than expected compared to G or T. 
+
+This could mean that certain regions of the genome have unique base compositions. These points seem unusual enough that they could be biologically significant, and they might be worth investigating further.
+
+### c. Find where these outlier bins are located along the chromosome; is there anything special about these regions?
+
+To answer this question, we extracted the chromosomal positions of all outlier bins identified across base pair comparisons. We then grouped these positions into 1Mb bins and counted how many outliers fell within each genomic region. In order to detect  the exact positions unusual bases the we used a bar plot.
+
+This allows us to pinpoint whether certain areas along the chromosome are enriched with unusual base compositions, which may indicate biologically significant features or irregularities.
+
+```{r, fig.width=12, fig.height=9}
+
+library(ggplot2)
+
+# Define base pairs from raw counts
+base_pairs <- combn(colnames(base_counts_group_b), 2, simplify = FALSE)
+
+# Compute base frequencies (per 1,000 bp)
+base_freqs <- base_counts_group_b / 1000
+
+# Define position vector in Mb
+chrom_pos_mb <- positions_b / 1e6
+
+# Create a list to store all outlier positions for all pairs
+outlier_positions_all_pairs <- list()
+
+# Loop through base pairs and compute residuals and outliers
+for (pair in base_pairs) {
+  x <- base_freqs[[pair[1]]]
+  y <- base_freqs[[pair[2]]]
+  
+  # Compute the mean and standard deviation for both x and y
+  mean_x <- mean(x, na.rm = TRUE)
+  sd_x <- sd(x, na.rm = TRUE)
+  mean_y <- mean(y, na.rm = TRUE)
+  sd_y <- sd(y, na.rm = TRUE)
+  
+  # Identify outliers (points that are more than 4 standard deviations from the mean)
+  outlier_x <- abs(x - mean_x) > 4 * sd_x  
+  outlier_y <- abs(y - mean_y) > 4 * sd_y  
+  
+  # Map to chromosome positions (Mb)
+  outlier_positions <- chrom_pos_mb[outlier_x | outlier_y]
+  
+  # Store in list
+  pair_name <- paste(pair[1], "vs", pair[2])
+  outlier_positions_all_pairs[[pair_name]] <- round(outlier_positions, 3)
+}
+
+# Combine all outlier positions into one vector
+all_outlier_positions <- unlist(outlier_positions_all_pairs)
+
+# Bin the chromosome into 1Mb intervals from 30 to 50
+bin_edges <- seq(30, 50, by = 1)
+bin_labels <- paste(bin_edges[-length(bin_edges)], bin_edges[-1], sep = "-")
+
+# Assign each outlier position to a bin
+bin_assignment <- cut(all_outlier_positions, breaks = bin_edges, labels = bin_labels, include.lowest = TRUE)
+
+# Count how many outliers are in each bin
+outlier_counts <- as.data.frame(table(bin_assignment))
+colnames(outlier_counts) <- c("Region", "Outlier_Count")
+
+# Convert count to numeric
+outlier_counts$Outlier_Count <- as.numeric(outlier_counts$Outlier_Count)
+
+# Plot bar chart using ggplot2 with value labels
+ggplot(outlier_counts, aes(x = Region, y = Outlier_Count, fill = Outlier_Count)) +
+  geom_bar(stat = "identity", color = "black") +
+  geom_text(aes(label = Outlier_Count), vjust = -0.5, size = 3.5) +  # Add value labels above bars
+  scale_fill_gradient(low = "#ffcccc", high = "#660000") +
+  theme_minimal() +
+  labs(title = "Outliers (above 4 S.D) enrichment Across Chromosome Regions (1Mb bins)",
+       x = "Genomic Region (Mb)",
+       y = "Number of Outlier Bins") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(size = 14, face = "bold"))
+
+
+```
+
+### Interpretation
+
+The bar chart above shows the number of outlier bins within different genomic regions across a chromosome. By filtering for values that exceed **4 standard deviations**, we eliminate any potential noise that might result from  measurement errors and more, ensuring that we are only highlighting meaningful variations.
+
+As shown in the graph, most outliers are between 41.0-42.0 Mb, suggesting these areas may be undergoing biologically significant changes or mutations.
+
+
+### Question 1(f) – Grouping DNA Bases into Two Pairs by Similar Behavior
+
+If we had to group the four DNA bases (A, T, C, G) into two pairs based on similar behavior, we would group **A and T** together and **C and G** together. This decision is supported by the smoothed frequency plots, where **A and T** follow very similar trends across the chromosome, and likewise for **C and G**. Their curves often rise and fall in parallel, which suggests shared biological properties, possibly related to complementary base pairing and local genomic structure.
+
+Interestingly, despite the visual similarity in A and T patterns, the correlation between them is slightly **negative** (r = -0.11). This might seem surprising at first. A possible explanation is that, while **A and T are globally enriched in the same regions**, at a more local level (bin by bin), they can still vary in opposite directions due to **random sequence variation** or **local compositional constraints**. So even though their smoothed trends align, the raw bin-level noise can result in a weak negative correlation.
+
+Additionally, we observe negative correlations between A-G (r = -0.42) and C-T (r = -0.39), which suggests an inverse relationship between these base pairs. These negative correlations make sense because A and G (as well as C and T) are not complementary base pairs in the DNA double helix. 
+
+For all these reasons, we chose to group A and T together and C and G together.
+
+

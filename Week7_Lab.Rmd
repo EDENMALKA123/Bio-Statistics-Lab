@@ -1,0 +1,1130 @@
+---
+title: "HW7"
+author: "Omer Abuhatzira, Eden Malka, Salome Baranes"
+date: "2025-05-02"
+output:
+  html_document: default
+  word_document: default
+---
+
+Group members:
+
+ - Omer Abuhazira 319119988 omer.abuhatzira@mail.huji.ac.il
+ - Eden Malka 318849940 eden.malka@mail.huji.ac.il
+ - Salome Baranes 209891183 salome.baranes@mail.huji.ac.il
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Libraries used
+
+```{r libraries, message=FALSE, warning=FALSE, results='hide'}
+library(ggplot2)      
+library(dplyr)      
+library(data.table)   
+library(splines)      
+library(knitr)   
+library(reshape2)
+```
+
+
+### Paths and Data - Data Preparation
+
+```{r paths, message=FALSE, warning=FALSE}
+library(data.table)
+
+# The read mapping file (from last week's lab)
+reads_file <- "C:/Users/97250/Downloads/TCGA-13-0723-01A_lib1_all_chr1.forward"
+chr1_reads <- fread(reads_file)
+colnames(chr1_reads) <- c("Chrom", "Loc", "FragLen")
+
+# Load and concatenate the full chromosome 1 sequence from 5 parts
+load_rda_string <- function(path) {
+  obj_name <- load(path)
+  get(obj_name)
+}
+
+# Load each .rda file
+s1 <- load_rda_string("C:/Users/97250/Downloads/chr1_str_0M_50M.rda")
+s2 <- load_rda_string("C:/Users/97250/Downloads/chr1_str_50M_100M.rda")
+s3 <- load_rda_string("C:/Users/97250/Downloads/chr1_str_100M_150M.rda")
+s4 <- load_rda_string("C:/Users/97250/Downloads/chr1_str_150M_200M.rda")
+s5 <- load_rda_string("C:/Users/97250/Downloads/chr1_str_200M_end.rda")
+
+# Concatenate to get the full chr1 sequence as a single character string
+chr1_seq <- paste0(s1, s2, s3, s4, s5)
+
+# Split into individual bases (A, C, G, T)
+chr1_full <- strsplit(chr1_seq, "")[[1]]
+
+# Check length (should be ~250 million)
+length(chr1_full)
+
+
+# Create GC/Coverage for 2.5K 
+compute_gc_and_coverage <- function(chr_bases, chr_reads, cell_size) {
+  n_bins <- floor(length(chr_bases) / cell_size)
+  breaks <- c(seq(0, length(chr_bases) + cell_size, by = cell_size))
+  
+  # Coverage
+  coverage <- hist(chr_reads$Loc, breaks = breaks, plot = FALSE)$counts[1:n_bins]
+  
+  # GC content
+  GC_per_bin <- numeric(n_bins)
+  for (i in 1:n_bins) {
+    bin <- chr_bases[((i - 1) * cell_size + 1):(i * cell_size)]
+    GC_per_bin[i] <- sum(bin %in% c("G", "C")) / cell_size
+  }
+  
+  data.frame(
+    Bin = seq_len(n_bins),
+    GC_Content = GC_per_bin,
+    Coverage = coverage,
+    Cell_Size = cell_size
+  )
+}
+
+df_2.5K <- compute_gc_and_coverage(chr1_full, chr1_reads, 2500)
+```
+
+### Introduction
+
+In this lab, we set out to estimate the copy number of genomic segments by analyzing sequencing coverage, while making sure to correct for GC-content bias.  
+The idea is that the observed coverage in each bin follows a Poisson distribution, where the expected rate depends both on the true copy number and on GC effects.  
+
+To handle this, we used the methods we developed in earlier labs:  
+we fitted a smooth function \( f(gc) \) to capture the systematic GC bias, and then used this to normalize the observed counts.  
+Once we had the corrected values, we estimated the underlying copy number \( a_i \) across the genome, looked at how it varied across different regions, and compared results between cancer and normal samples.  
+
+Along the way, we also simulated data, calculated performance metrics like RMSE and residual variance, and checked how tightly the copy number estimates clustered around the expected diploid value.  
+Finally, we explored both global patterns across the full genome and local patterns in smaller selected regions to get a complete picture of the data.
+
+
+### Before We Begin – Outlier Filtering from our previous labs:
+
+### first Filtering
+
+
+```{r, message=FALSE, warning=FALSE}
+library(data.table)
+library(ggplot2)
+
+# Define bin size
+bin_size <- 10000
+n_bins <- ceiling(length(chr1_full) / bin_size)
+
+# Calculate coverage (number of reads per bin)
+bin_breaks <- c(seq(0, length(chr1_full) + bin_size, by = bin_size))
+coverage <- hist(chr1_reads$Loc, breaks = bin_breaks, plot = FALSE)$counts
+
+# Prepare dataframe
+df <- data.frame(
+  Bin = seq_along(coverage),
+  Coverage = coverage
+)
+
+# Smooth coverage using LOESS
+smoothed_line <- loess(Coverage ~ Bin, data = df, span = 0.05)
+df$Smoothed <- predict(smoothed_line)
+
+# Calculate residuals
+df$Residual <- df$Coverage - df$Smoothed
+
+# Calculate IQR from residuals
+Q1 <- quantile(df$Residual, 0.25)
+Q3 <- quantile(df$Residual, 0.75)
+IQR_val <- Q3 - Q1
+
+upper_threshold <- Q3 + 1.5 * IQR_val
+lower_threshold <- Q1 - 1.5 * IQR_val
+
+# Define upper and lower outliers
+df$OutlierType <- "None"
+df$OutlierType[df$Residual > upper_threshold] <- "Above LOESS"
+df$OutlierType[df$Residual < lower_threshold] <- "Below LOESS"
+
+# Create clean dataset without outliers and low coverage for further use
+df_clean <- df[df$OutlierType == "None" & df$Coverage >= 5, ]
+
+
+```
+
+### Second filtering + Ploting + Cubic SPline:
+
+
+```{r, message=FALSE, warning=FALSE}
+library(splines)
+library(dplyr)
+library(ggplot2)
+
+# GC Content per bin
+GC_per_bin <- numeric(n_bins)
+for (i in 1:n_bins) {
+  bin <- chr1_full[((i - 1) * bin_size + 1):(i * bin_size)]
+  GC_per_bin[i] <- sum(bin %in% c("G", "C")) / bin_size
+}
+
+# Create df_model with Coverage + GC_Content
+df_model <- data.frame(
+  Bin = seq_along(coverage),
+  Coverage = coverage,
+  GC_Content = GC_per_bin
+)
+
+# Compute LOESS and prediction
+loess_fit <- loess(Coverage ~ GC_Content, data = df_model, span = 0.5)
+df_model$LOESS_Fit <- predict(loess_fit)
+
+# Filter GC_Content >= 0.2
+df_model <- df_model %>% filter(GC_Content >= 0.3)
+
+# Remove outliers using IQR method
+df_model$Residual <- df_model$Coverage - df_model$LOESS_Fit
+iqr_val <- IQR(df_model$Residual, na.rm = TRUE)
+q1 <- quantile(df_model$Residual, 0.25, na.rm = TRUE)
+q3 <- quantile(df_model$Residual, 0.75, na.rm = TRUE)
+lower_bound <- q1 - 3.25 * iqr_val
+upper_bound <- q3 + 3.25 * iqr_val
+
+df_clean <- df_model %>%
+  filter(Residual >= lower_bound, Residual <= upper_bound)
+
+# Additional filter: remove top 1% most extreme residuals
+abs_res <- abs(df_clean$Residual)
+threshold_1pct <- quantile(abs_res, 0.98)
+df_clean <- df_clean %>% filter(abs(Residual) <= threshold_1pct)
+
+# Define 5 knots explicitly
+knots_gc <- quantile(df_clean$GC_Content, probs = seq(0.2, 0.8, length.out = 5))
+
+# Final spline fit with 5 knots
+fit <- lm(Coverage ~ bs(GC_Content, knots = knots_gc, degree = 3), data = df_clean)
+df_clean$Cubic_Fit <- predict(fit)
+mae <- round(mean(abs(df_clean$Coverage - df_clean$Cubic_Fit)), 2)
+
+# Identify removed points
+removed_pts <- anti_join(df_model, df_clean, by = c("GC_Content", "Coverage"))
+
+# Calculate percentage of removed points
+pct_removed <- round(100 * nrow(removed_pts) / (nrow(removed_pts) + nrow(df_clean)), 1)
+label_text <- paste0(pct_removed, "% of points removed")
+
+
+```
+
+
+### Outlier Filtering and Model Fitting interpetation:
+
+In the first step, we calculated sequencing coverage across 10,000bp bins and applied a LOESS smoothing function to capture the general trend in coverage along the chromosome. We then computed the residuals and removed bins whose residuals were outside the range defined by **Q1 − 1.5 × IQR** and **Q3 + 1.5 × IQR**. Additionally, bins with very low coverage (less than 5 reads) were filtered out.
+
+In the second step, we refined the filtering process to better capture the relationship between GC content and sequencing coverage. First, we excluded bins with low GC values, keeping only those with GC content above 0.3. Then, we fitted a LOESS model to the data and calculated the residuals. We used the IQR method again, but this time with a wider range (**±3.25 × IQR**) to filter out more extreme points that don’t follow the LOESS trend well.
+
+Additionally, based on visual inspection, we noticed that a few extreme points still remained and distorted the fit. To address this, we removed the top 2% most extreme residuals. Now we can start.
+
+
+### Part A : Fitting the Cubic Spline on Cleaned 2.5K Bins
+
+In the previous lab, we cleaned the data and fit our cubic spline model to explore the relationship between GC content and coverage across different bin sizes.  
+Here, we continue that work by focusing specifically on the 2.5K bin size, preparing the cleaned data, fitting the spline, and visualizing the results.
+
+
+```{r, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(splines)
+
+# Take the Bin IDs from the cleaned 10K dataset
+clean_10K_ids <- df_clean$Bin
+
+# Build a mapping to 2.5K bins for the same regions
+map_2.5K_clean <- lapply(clean_10K_ids, function(i) {
+  data.frame(TestBin = i, Bin = ((i - 1) * 4 + 1):(i * 4))
+}) %>% bind_rows()
+
+# Build a new 2.5K dataframe with GC and Coverage only for those bins
+df_clean_2.5K <- df_2.5K %>%
+  inner_join(map_2.5K_clean, by = "Bin") %>%
+  filter(GC_Content >= 0.3, Coverage > 0)
+
+# Fit a Cubic Spline model
+knots_gc <- quantile(df_clean_2.5K$GC_Content, probs = seq(0.2, 0.8, length.out = 5))
+fit <- lm(Coverage ~ bs(GC_Content, knots = knots_gc, degree = 3), data = df_clean_2.5K)
+df_clean_2.5K$Cubic_Fit <- predict(fit)
+mae <- round(mean(abs(df_clean_2.5K$Coverage - df_clean_2.5K$Cubic_Fit)), 2)
+
+# Plot the graph
+ggplot(df_clean_2.5K, aes(x = GC_Content, y = Coverage)) +
+  geom_point(aes(color = GC_Content), alpha = 0.4, size = 1) +
+  geom_line(aes(y = Cubic_Fit), linetype = "dashed", color = "black", size = 1.2) +
+  geom_vline(xintercept = knots_gc, linetype = "dashed", color = "gray30") +
+  scale_color_gradient(low = "blue", high = "red", name = "GC %") +
+  labs(
+    title = "Coverage vs GC Content – 2.5K Bins",
+    subtitle = paste("Cubic Spline with 5 Knots, MAE =", mae),
+    x = "GC Content",
+    y = "Coverage"
+  ) +
+  coord_cartesian(xlim = c(0.3, 0.7), ylim = c(0, 375)) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(size = 17, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 14, hjust = 0.5),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    legend.position = "none"
+  )
+
+```
+
+### Interppetation:
+
+The plot shows how well the cubic spline fits the cleaned 2.5K data.  
+We can see the fitted trend line (dashed) over the scatter of real coverage points, helping us check how well the model captures the GC effect in these bins.
+
+
+
+### Q1: Estimating the Genomic Copy Number Function (Cubic Spline)
+
+In this section, we are asked to estimate the function \( f(gc) \), which represents the GC-related bias in the expected genomic coverage.
+To do this, we fit a cubic spline model (with 5 internal knots) using the cleaned 2.5K bin dataset, where the goal is to capture the non-linear relationship between GC content and observed coverage.
+We then apply this model across the entire dataset, generating predicted values \( f(gc) \) for each bin.
+Additionally, we include a small test to confirm that our function works on a single GC input value, as requested in the question.
+
+
+```{r, message=FALSE, warning=FALSE}
+
+
+# Load libraries
+library(splines)
+library(dplyr)
+library(ggplot2)
+
+# Define spline knots
+knots_gc <- quantile(df_clean_2.5K$GC_Content, probs = seq(0.2, 0.8, length.out = 5))
+
+# Fit cubic spline model
+fit_cubic <- lm(Coverage ~ bs(GC_Content, knots = knots_gc, degree = 3), data = df_clean_2.5K)
+
+# Define f(gc) function that returns predicted values (ensure non-negative)
+f_function <- function(gc_value) {
+  pmax(predict(fit_cubic, newdata = data.frame(GC_Content = gc_value)), 0)
+}
+
+# Apply f(gc) to the whole dataset, clipped to GC range
+gc_min <- min(df_clean_2.5K$GC_Content)
+gc_max <- max(df_clean_2.5K$GC_Content)
+
+df_clean_2.5K <- df_clean_2.5K %>%
+  mutate(
+    GC_clipped = pmin(pmax(GC_Content, gc_min), gc_max),
+    f_hat = f_function(GC_clipped),
+    Y = Coverage,
+    GC = GC_Content
+  )
+
+# Extract vectors
+vector_Y <- df_clean_2.5K$Y
+vector_GC <- df_clean_2.5K$GC
+vector_f  <- df_clean_2.5K$f_hat
+
+# Print vector stats
+cat("Vector lengths:\n",
+    "Y  =", length(vector_Y), "\n",
+    "GC =", length(vector_GC), "\n",
+    "f  =", length(vector_f), "\n")
+
+cat("f(gc) summary:\n")
+print(summary(vector_f))
+cat("Mean =", mean(vector_f), ", SD =", sd(vector_f), "\n")
+
+# Check R^2 of fit
+model_r2 <- summary(fit_cubic)$r.squared
+cat("R^2 of cubic spline model =", model_r2, "\n")
+
+# Check single value test
+test_gc <- 0.5
+test_f  <- f_function(test_gc)
+
+if (length(test_f) == 1 && is.numeric(test_f) && test_f >= 0) {
+  cat("Test single value works: f(", test_gc, ") =", test_f, "\n")
+} else {
+  warning("Test single value failed! Check f_function definition.")
+}
+
+# Compute estimated copy number vector
+df_clean_2.5K$a_i <- df_clean_2.5K$Y / df_clean_2.5K$f_hat
+
+library(ggplot2)
+
+# Histogram with reference lines
+ggplot(df_clean_2.5K, aes(x = a_i)) +
+  geom_histogram(binwidth = 0.05, fill = "skyblue", color = "black") +
+  geom_vline(xintercept = c(0.5, 1, 1.5, 2), linetype = "dashed", color = "red", size = 0.8) +
+  labs(
+    title = "Estimated Copy Number per Bin (aᵢ)",
+    x = expression(a[i]),
+    y = "Number of Bins"
+  ) +
+  annotate("text", x = c(0.5, 1, 1.5, 2), y = max(table(cut(df_clean_2.5K$a_i, breaks = 100))) * 0.9,
+           label = c("0.5", "1", "1.5", "2"), color = "red", angle = 90, vjust = -0.5) +
+  theme_minimal(base_size = 14)
+
+```
+
+
+
+
+### Interpretation 
+
+We began by verifying the successful construction of the input vectors: observed coverage \( Y \), GC content \( GC \), and the fitted function values \( f(gc) \). All three vectors had equal length (83,796), indicating complete alignment across bins. The spline-based prediction \( f(gc) \) displayed a median of approximately 134, a mean of approximately 135, and a standard deviation of about 44 — suggesting a well-centered and reasonably symmetric distribution. The model achieved an excellent goodness-of-fit, with \( R^2 \approx 0.83 \), meaning that over 80% of the variation in coverage is explained by GC content alone. We also confirmed that the spline function behaves robustly for single values (e.g., \( f(0.5) \approx 199 \)).
+
+After computing the estimated copy number vector \( a_i = \frac{Y_i}{f(gc_i)} \), we plotted its distribution. The resulting histogram is sharply peaked around 1.0, as expected under the assumption of uniform diploid copy number. Importantly, we observe secondary density near \( a_i = 0.5 \) and \( a_i = 1.5 \), and light tails beyond 2, which may reflect real biological variation or technical noise. These results demonstrate that our fitted model not only captures GC-driven coverage variation, but also enables meaningful inference of copy number structure across the genome.
+
+We also tested the function on a single value to ensure the spline correctly returns nonnegative predicted values, even outside the main data range.
+
+### Q2.a: Simulate Copy Numbers in 1000 Continuous Bins Using f(GC)
+
+In this part, we were asked to simulate copy numbers over a block of 1000 continuous bins using the \( f(GC) \) function we estimated earlier.  
+We applied a true \( a_i \) value (set here as 1.5) and added random noise to make the simulated data more realistic.  
+Then, we compared the simulated counts to the estimated smooth values, calculated summary stats, and created plots to visualize how well the simulation matches the expected model.
+
+
+
+```{r, message=FALSE, warning=FALSE}
+# Select a continuous region of 1000 bins from the cleaned 2.5K dataset
+set.seed(42)
+start_idx <- 20000
+end_idx <- start_idx + 999
+region_df <- df_clean_2.5K[start_idx:end_idx, ]
+
+# Compute estimated copy number
+region_df <- region_df %>%
+  mutate(a_i = Y / f_hat)
+
+# Compute summary stats
+mean_ai <- mean(region_df$a_i)
+median_ai <- median(region_df$a_i)
+sd_ai <- sd(region_df$a_i)
+
+# Plot 1: Spatial distribution of a_i across the region
+# Create color groups for legend
+region_df$group <- "Observed aᵢ"
+
+ggplot(region_df, aes(x = 1:1000, y = a_i, color = group)) +
+  geom_line(size = 0.6) +
+  geom_smooth(aes(color = "Smoothed Trend (LOESS)"), method = "loess", se = FALSE, size = 1.2) +
+  geom_hline(aes(yintercept = 0.5, color = "Theoretical aᵢ Values"), linetype = "dashed", size = 0.8) +
+  geom_hline(aes(yintercept = 1.0, color = "Theoretical aᵢ Values"), linetype = "dashed", size = 0.8) +
+  geom_hline(aes(yintercept = 1.5, color = "Theoretical aᵢ Values"), linetype = "dashed", size = 0.8) +
+  geom_hline(aes(yintercept = 2.0, color = "Theoretical aᵢ Values"), linetype = "dashed", size = 0.8) +
+  scale_color_manual(
+    name = "Line Types",
+    values = c(
+      "Observed aᵢ" = "#9ecae1",  # blue lightened
+      "Smoothed Trend (LOESS)" = "#e69f00",
+      "Theoretical aᵢ Values" = "#cc0000"
+    )
+  ) +
+  labs(
+    title = "Estimated Copy Number Along 1000 Bins",
+    subtitle = paste0("Mean = ", round(mean_ai, 3), ", SD = ", round(sd_ai, 3)),
+    x = "Bin Index in Chromosome",
+    y = expression(a[i])
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "top",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11)
+  )
+
+
+# Plot 2: Marginal distribution (histogram) of a_i
+# Create labeled color mapping
+region_df_long <- region_df %>%
+  mutate(dummy = 1)  # needed to map vlines to legend keys
+
+ggplot(region_df, aes(x = a_i)) +
+  geom_histogram(binwidth = 0.05, fill = "lightblue", color = "black") +
+  geom_vline(aes(xintercept = mean_ai, color = "Mean"), linetype = "solid", size = 1) +
+  geom_vline(aes(xintercept = median_ai, color = "Median"), linetype = "dotted", size = 1) +
+  geom_vline(aes(xintercept = 0.5, color = "Theoretical aᵢ"), linetype = "dashed", size = 0.8) +
+  geom_vline(aes(xintercept = 1.0, color = "Theoretical aᵢ"), linetype = "dashed", size = 0.8) +
+  geom_vline(aes(xintercept = 1.5, color = "Theoretical aᵢ"), linetype = "dashed", size = 0.8) +
+  geom_vline(aes(xintercept = 2.0, color = "Theoretical aᵢ"), linetype = "dashed", size = 0.8) +
+  scale_color_manual(
+    name = "Vertical Lines",
+    values = c(
+      "Mean" = "#1B9E77",
+      "Median" = "#7570B3",
+      "Theoretical aᵢ" = "#CC0000"
+    )
+  ) +
+  labs(
+    title = "Marginal Distribution of Estimated Copy Number (aᵢ)",
+    subtitle = paste0("Mean = ", round(mean_ai, 3),
+                      ", Median = ", round(median_ai, 3),
+                      ", SD = ", round(sd_ai, 3)),
+    x = expression(a[i]),
+    y = "Number of Bins"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "top",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11)
+  )
+
+# Print summary in console
+summary(region_df$a_i)
+sd_ai
+
+# Residual Bias Check
+ggplot(region_df, aes(x = GC, y = a_i)) +
+  geom_point(alpha = 0.3, color = "darkblue") +
+  geom_smooth(method = "loess", se = FALSE, color = "orange") +
+  labs(title = "Copy Number vs GC Content (Post f(GC) Normalization)",
+       x = "GC Content", y = expression(a[i])) +
+  theme_minimal(base_size = 14)
+
+```
+
+
+### Interpretation
+
+To assess the estimated copy number \( a_i \) across a selected genomic region of 1000 consecutive bins, we computed the estimator \( a_i = \frac{Y_i}{f(gc_i)} \), where \( f(gc_i) \) is the expected coverage as a function of GC content, fitted via a cubic spline.
+
+In the **first plot**, we visualize the spatial behavior of \( a_i \) along the chromosome. The values fluctuate moderately around 1, with a **mean of 1.031** and **standard deviation of 0.125**. The LOESS smoothing curve shows no strong spatial trend, and the deviations appear symmetric and well-bounded. Horizontal dashed lines at 0.5, 1.0, 1.5, and 2.0 provide reference for common copy number states.
+
+The **second plot** shows the **marginal distribution** of the \( a_i \) estimates. The distribution is centered slightly above 1, with nearly identical mean and median (1.031 and 1.033, respectively), indicating low skewness. Vertical lines distinguish both theoretical values and empirical summaries.
+
+Finally, to evaluate whether any GC-dependent bias remained after correction, we plotted **\( a_i \) versus GC content**. The LOESS trend is mostly flat, but decreases slightly at high GC levels, suggesting a small residual bias in GC-rich bins.
+
+Overall, the results suggest that the spline-based correction function captured the main GC bias structure, and the resulting copy number estimates \( a_i \) are tightly clustered around the expected value of 1, with variation consistent with typical sequencing noise.
+
+
+
+### Q2.b: Proximity of Estimated Copy Numbers to 1
+
+Here, we wanted to check how close our estimated copy numbers \( a_i \) are to the expected diploid value of 1.  
+To do that, we calculated the percentage of bins where \( a_i \) falls within a few symmetric tolerance ranges centered around 1.
+
+Specifically, we looked at:
+- \( a_i \) between 0.9 and 1.1 → ±10%  
+- \( a_i \) between 0.95 and 1.05 → ±5%  
+- \( a_i \) between 0.98 and 1.02 → ±2%
+
+These cutoffs help us see how tightly our estimates cluster around the expected value and give a clear sense of how accurate and stable the estimator is.  
+We showed the results both as percentages and in a summary bar plot to make the patterns easy to spot.
+
+
+```{r, message=FALSE, warning=FALSE}
+# Define tolerance windows
+tolerance_levels <- c(0.10, 0.05, 0.02)
+
+# Compute proportions for each tolerance
+tolerance_df <- data.frame(
+  Tolerance = paste0("±", tolerance_levels * 100, "%"),
+  Proportion = sapply(tolerance_levels, function(tol) {
+    mean(region_df$a_i >= (1 - tol) & region_df$a_i <= (1 + tol))
+  })
+)
+
+# Add percentage labels for plotting
+tolerance_df$Label <- paste0(round(tolerance_df$Proportion * 100, 1), "%")
+
+# Reorder bars to show increasing tolerance
+tolerance_df$Tolerance <- factor(
+  tolerance_df$Tolerance,
+  levels = c("±2%", "±5%", "±10%")
+)
+
+# Load ggplot2
+library(ggplot2)
+
+# Bar plot with sorted bars and visible labels
+ggplot(tolerance_df, aes(x = Tolerance, y = Proportion * 100, fill = Tolerance)) +
+  geom_bar(stat = "identity", width = 0.5) +
+  geom_text(aes(label = Label), vjust = -0.3, size = 4.5) +
+  scale_fill_manual(values = c("#a1d99b", "#41ab5d", "#005a32")) +
+  labs(
+    title = "Proportion of aᵢ Estimates Near 1",
+    subtitle = "Percentage of bins where aᵢ is within tolerance of 1",
+    x = "Tolerance Window (%)",
+    y = "Percentage of Bins"
+  ) +
+  ylim(0, 70) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold")
+  )
+
+
+# Define tolerance range
+tolerance_range <- seq(0.01, 0.3, by = 0.005)
+
+# Compute proportion for each tolerance
+tolerance_curve <- data.frame(
+  Tolerance = tolerance_range,
+  Proportion = sapply(tolerance_range, function(tol) {
+    mean(region_df$a_i >= (1 - tol) & region_df$a_i <= (1 + tol))
+  })
+)
+
+# Define the three specific tolerance levels to annotate
+highlight_tols <- c(0.02, 0.05, 0.10)
+highlight_df <- do.call(rbind, lapply(highlight_tols, function(tol) {
+  idx <- which.min(abs(tolerance_curve$Tolerance - tol))
+  tolerance_curve[idx, ]
+}))
+highlight_df$Label <- paste0(round(highlight_df$Proportion * 100, 1), "%")
+
+# Plot with red dots and vertical reference at 10%
+library(ggplot2)
+
+ggplot(tolerance_curve, aes(x = Tolerance * 100, y = Proportion * 100)) +
+  geom_line(color = "#238b45", size = 1.2) +
+  geom_vline(xintercept = 10, linetype = "dashed", color = "red", size = 1) +
+  geom_point(data = highlight_df, aes(x = Tolerance * 100, y = Proportion * 100),
+             color = "red", size = 3) +
+  geom_text(data = highlight_df,
+            aes(x = Tolerance * 100, y = Proportion * 100, label = Label),
+            vjust = -0.8, hjust = 0.5, color = "black", size = 4) +
+  labs(
+    title = "Percentage of aᵢ Estimates Within Tolerance of 1",
+    subtitle = "Smooth curve with reference at ±10%",
+    x = "Tolerance Window (%)",
+    y = "Percentage of Bins"
+  ) +
+  ylim(0, 100) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold")
+  )
+
+```
+
+### Interpretation
+
+- Only **14.3%** of the bins fall within a tight window of **±2%**, indicating that very few bins are estimated with high precision.
+- A **moderate** share of **33.5%** lies within the **±5%** range — already suggesting some robustness in estimation.
+- A **clear majority** of **60.5%** of bins are captured within a **±10%** window, showing that the estimator is reasonably centered but still exhibits notable variability.
+
+The tolerance curve backs this up: beyond ±10%, the improvement in coverage is pretty minimal.  
+This suggests that ±10% is a good natural cutoff — wide enough to capture most of the stable region, but still tight enough to reflect meaningful biological patterns.
+
+
+
+### Q3: Qualitative Evaluation of the Estimator a_i:
+
+The estimator \( \hat{a}_i = Y_i / f(\text{GC}_i) \) shows reasonable behavior overall. It is centered around the expected value of 1, with **over 60%** of bins falling within a **±10%** tolerance. While only **14.3%** of bins lie within a stricter ±2% window, the smooth tolerance curve indicates a **stable and gradual increase**, suggesting robustness across a range of thresholds.
+
+That said, we still observe some residual bias at GC extremes, which may reflect **incomplete correction** by \( f(\text{GC}) \). Since the estimator accounts only for GC content, it could miss other influential factors such as **mappability issues** or **biological variability**. Nonetheless, within its scope, this estimator provides a **solid normalization** of coverage across the genome.
+
+
+
+
+### Part B: 
+
+## Loading New Normal Sample Data:
+
+```{r, message=FALSE, warning=FALSE}
+### Load normal sample:
+
+library(data.table)
+
+# Normal (healthy) sample — reading directly from .gz file
+file_normal_gz <- "C:/Users/97250/Downloads/TCGA-13-0723-10B_lib1_all_chr1.forward.gz"
+reads_normal <- fread(file_normal_gz)
+colnames(reads_normal) <- c("Chrom", "Loc", "FragLen")
+cat("Normal sample loaded:", nrow(reads_normal), "rows\n")
+```
+
+
+## Calculating GC Content and Coverage per 2.5K Bins - to the Nornal Sample:
+
+We define a function that calculates both GC content and sequencing coverage across the genome, dividing the sequence into bins of 2,500 bases each. We then apply this function to the normal dataset only.
+
+
+```{r, message=FALSE, warning=FALSE}
+compute_gc_and_coverage <- function(chr_bases, chr_reads, cell_size) {
+  n_bins <- floor(length(chr_bases) / cell_size)
+  breaks <- c(seq(0, length(chr_bases) + cell_size, by = cell_size))
+  
+  # Coverage
+  coverage <- hist(chr_reads$Loc, breaks = breaks, plot = FALSE)$counts[1:n_bins]
+  
+  # GC content
+  GC_per_bin <- numeric(n_bins)
+  for (i in 1:n_bins) {
+    bin <- chr_bases[((i - 1) * cell_size + 1):(i * cell_size)]
+    GC_per_bin[i] <- sum(bin %in% c("G", "C")) / cell_size
+  }
+  
+  data.frame(
+    Bin = seq_len(n_bins),
+    GC_Content = GC_per_bin,
+    Coverage = coverage,
+    Cell_Size = cell_size
+  )
+}
+
+# Apply to both samples
+df_normal_2.5K <- compute_gc_and_coverage(chr1_full, reads_normal, 2500)
+```
+
+
+In this section, we model the relationship between GC content and sequencing coverage for the **normal sample** using a cubic spline. This helps us visualize and capture any nonlinear trends or biases in coverage as a function of GC content.
+
+
+```{r, message=FALSE, warning=FALSE}
+
+library(ggplot2)
+library(splines)
+
+# Set number of knots and their quantiles
+num_knots <- 6
+quantiles <- quantile(df_normal_2.5K$GC_Content, probs = seq(0.05, 0.95, length.out = num_knots))
+
+# Fit cubic spline model
+fit_normal <- lm(Coverage ~ bs(GC_Content, knots = quantiles, degree = 3), data = df_normal_2.5K)
+
+# Predict fitted values
+df_normal_2.5K$Fitted <- predict(fit_normal)
+
+# Plot GC vs Coverage
+ggplot(df_normal_2.5K, aes(x = GC_Content, y = Coverage)) +
+  geom_point(alpha = 0.25, color = "#1f78b4", size = 1.2) +  # darker blue
+  geom_line(aes(y = Fitted), color = "#e6550d", size = 1.3) +  # darker orange
+  labs(
+    title = "Coverage vs GC Content – Normal Sample (2.5K bins)",
+    subtitle = "Fitted with Cubic Spline (degree 3)",
+    x = "GC Content",
+    y = "Coverage"
+  ) +
+  ylim(0, 400) +
+  coord_cartesian(xlim = c(0.3, 0.7)) +
+  theme_minimal(base_size = 16) +
+  theme(
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 14, hjust = 0.5),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12)
+  )
+
+```
+
+We observe a clear GC-dependent pattern: coverage increases up to GC ≈ 0.5 and then decreases. This shape matches the trend seen in the cancer original sample and reflects typical GC bias in sequencing data.
+
+That is why we decided to clean the new normal sample data in a similar way to the cancer sample, removing outliers and fitting a cubic spline model to capture the GC-coverage relationship more accurately:
+
+
+```{r, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(splines)
+
+# Copy and rename the dataset to avoid overwriting
+df_model_normal <- df_normal_2.5K
+
+# Fit LOESS for initial smoothing
+loess_fit <- loess(Coverage ~ GC_Content, data = df_model_normal, span = 0.5)
+df_model_normal$LOESS_Fit <- predict(loess_fit)
+
+# Filter GC_Content >= 0.3
+df_model_normal <- df_model_normal %>% filter(GC_Content >= 0.3)
+
+# Remove outliers based on IQR of residuals (step 1)
+df_model_normal$Residual <- df_model_normal$Coverage - df_model_normal$LOESS_Fit
+iqr_val <- IQR(df_model_normal$Residual, na.rm = TRUE)
+q1 <- quantile(df_model_normal$Residual, 0.25, na.rm = TRUE)
+q3 <- quantile(df_model_normal$Residual, 0.75, na.rm = TRUE)
+lower_bound <- q1 - 3.25 * iqr_val
+upper_bound <- q3 + 3.25 * iqr_val
+
+df_clean_normal <- df_model_normal %>%
+  filter(Residual >= lower_bound, Residual <= upper_bound)
+
+# Additional filtering: remove top 2% most extreme residuals
+abs_res <- abs(df_clean_normal$Residual)
+threshold_2pct <- quantile(abs_res, 0.98)
+df_clean_normal <- df_clean_normal %>% filter(abs(Residual) <= threshold_2pct)
+
+# Define 5 knots for cubic spline
+knots_gc <- quantile(df_clean_normal$GC_Content, probs = seq(0.2, 0.8, length.out = 5))
+
+# Fit cubic spline model
+fit_normal <- lm(Coverage ~ bs(GC_Content, knots = knots_gc, degree = 3), data = df_clean_normal)
+df_clean_normal$Cubic_Fit <- predict(fit_normal)
+
+# Compute MAE
+mae_normal <- round(mean(abs(df_clean_normal$Coverage - df_clean_normal$Cubic_Fit)), 2)
+
+# Track removed points and percentage
+removed_pts_normal <- anti_join(df_model_normal, df_clean_normal, by = c("GC_Content", "Coverage"))
+pct_removed_normal <- round(100 * nrow(removed_pts_normal) / (nrow(removed_pts_normal) + nrow(df_clean_normal)), 1)
+label_text_normal <- paste0(pct_removed_normal, "% of points removed")
+
+
+# Plot
+ggplot(df_clean_normal, aes(x = GC_Content, y = Coverage)) +
+  geom_point(color = "#1f78b4", alpha = 0.3, size = 1.2) +  
+  geom_line(aes(y = Cubic_Fit), color = "#e6550d", size = 1.3) + 
+  labs(
+    title = "Coverage vs GC Content – Normal Sample (2.5K bins)",
+    subtitle = paste0("Fitted with Cubic Spline (degree 3), MAE = ", mae_normal),
+    x = "GC Content",
+    y = "Coverage"
+  ) +
+  annotate("text", x = 0.72, y = max(df_clean_normal$Coverage), 
+           label = label_text_normal, color = "gray30", hjust = 1, size = 4) +
+  theme_minimal(base_size = 16) +
+  theme(
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 14, hjust = 0.5),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12)
+  )
+
+```
+
+
+After filtering out extreme GC values and outliers, the fitted spline now captures the main GC–coverage trend more clearly and smoothly. The MAE of 19.13 reflects a good fit, and only 4.5% of bins were removed—suggesting the data is mostly clean, with minimal noise. The curve still peaks near GC ≈ 0.5, as expected. These will be the basis for our later analyses and comparisons.
+
+
+
+### Q1 : Comparing GC → Coverage across cancer and normal samples
+
+Before running the code, we wanted to answer the question:  
+how does the relationship between GC content and sequencing coverage compare between the cancer and normal samples?  
+To explore this, we used two approaches:
+First, we plotted the fitted spline curves (`Cubic_Fit`) from both cleaned datasets to directly compare the estimated GC–coverage functions.  
+Then, we computed the **conditional mean coverage** (E[Coverage | GC]) by binning the GC content (bin width = 0.02) and calculating the average coverage per bin for each sample.  
+
+
+```{r, message=FALSE, warning=FALSE}
+
+# Create a unified dataset with only the relevant columns
+tumor_plot_df <- df_clean_2.5K[, c("GC_Content", "Cubic_Fit")]
+tumor_plot_df$Sample <- "Tumor"
+
+normal_plot_df <- df_clean_normal[, c("GC_Content", "Cubic_Fit")]
+normal_plot_df$Sample <- "Normal"
+
+# Combine into one dataframe
+df_both <- rbind(tumor_plot_df, normal_plot_df)
+
+# Plot both fitted curves
+library(ggplot2)
+ggplot(df_both, aes(x = GC_Content, y = Cubic_Fit, color = Sample)) +
+  geom_line(size = 1.2) +
+  labs(
+    title = "Comparison of Fitted GC-Coverage Curves",
+    subtitle = "Tumor vs Normal (cleaned, cubic spline fit)",
+    x = "GC Content",
+    y = "Fitted Coverage"
+  ) +
+  scale_color_manual(values = c("Tumor" = "#e41a1c", "Normal" = "#377eb8")) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.title = element_blank()
+  )
+
+
+```
+
+
+
+```{r, message=FALSE, warning=FALSE}
+
+# Ensure Residual columns exist
+if (!"Residual" %in% colnames(df_clean_2.5K)) {
+  df_clean_2.5K$Residual <- df_clean_2.5K$Coverage - df_clean_2.5K$Cubic_Fit
+}
+
+if (!"Residual" %in% colnames(df_clean_normal)) {
+  df_clean_normal$Residual <- df_clean_normal$Coverage - df_clean_normal$Cubic_Fit
+}
+
+# Compute RMSE for both samples
+rmse_cancer <- sqrt(mean((df_clean_2.5K$Coverage - df_clean_2.5K$Cubic_Fit)^2, na.rm = TRUE))
+rmse_normal <- sqrt(mean((df_clean_normal$Coverage - df_clean_normal$Cubic_Fit)^2, na.rm = TRUE))
+
+# Compute variance of residuals
+var_cancer <- var(df_clean_2.5K$Residual, na.rm = TRUE)
+var_normal <- var(df_clean_normal$Residual, na.rm = TRUE)
+
+# Print comparison
+cat("Cancer sample — RMSE:", round(rmse_cancer, 2), " | Variance of residuals:", round(var_cancer, 2), "\n")
+cat("Normal sample — RMSE:", round(rmse_normal, 2), " | Variance of residuals:", round(var_normal, 2), "\n")
+
+
+```
+We did a quantitative comparison of the regression fits by calculating the RMSE and variance of the residuals.  
+For the cancer sample, we got an RMSE of 19.76 and a residual variance of 390.29.  
+For the normal sample, the RMSE was 24.68 and the variance was 622.31.
+
+This tells us that even though the GC–coverage relationship looks similar in shape for both samples,  
+the normal sample has a bit more variability, probably due to biological noise or technical factors.  
+In short, the models don’t behave exactly the same across the two datasets,  
+which highlights why it’s so important to check not just the shape of the fit but also the residual patterns and fit quality when correcting for GC bias.
+
+
+```{r, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+
+# Define GC bins of width 0.02
+bin_width <- 0.02
+gc_bins <- seq(0, 1, by = bin_width)
+
+# Assign GC bins
+df_clean_2.5K <- df_clean_2.5K %>%
+  mutate(GC_Bin = cut(GC_Content, breaks = gc_bins, include.lowest = TRUE))
+
+df_clean_normal <- df_clean_normal %>%
+  mutate(GC_Bin = cut(GC_Content, breaks = gc_bins, include.lowest = TRUE))
+
+# Compute mean coverage per bin
+mean_cancer <- df_clean_2.5K %>%
+  group_by(GC_Bin) %>%
+  summarise(Mean_Coverage = mean(Coverage), .groups = "drop") %>%
+  mutate(Sample = "Cancer")
+
+mean_normal <- df_clean_normal %>%
+  group_by(GC_Bin) %>%
+  summarise(Mean_Coverage = mean(Coverage), .groups = "drop") %>%
+  mutate(Sample = "Normal")
+
+# Combine and extract bin midpoints
+mean_combined <- bind_rows(mean_cancer, mean_normal) %>%
+  mutate(GC_Mid = as.numeric(sub("\\((.+),(.+)\\]", "\\1", GC_Bin)) + bin_width / 2)
+
+# Plot both conditional means (cleaned data)
+ggplot(mean_combined, aes(x = GC_Mid, y = Mean_Coverage, color = Sample)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  labs(
+    title = "Mean Coverage by GC Content (Cleaned Data, Binned)",
+    x = "GC Content",
+    y = "Mean Coverage"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "top"
+  )
+
+```
+
+
+### Interpretation
+
+Looking at the results, we can clearly see that both the tumor and normal samples show a non-linear relationship between GC content and coverage, with a bell-shaped curve that peaks around moderate GC values.  
+The shapes of the fitted functions are pretty similar, which tells us that **GC bias is present in both samples**.
+
+That said, the overall coverage is consistently higher in the normal sample across almost all GC ranges.  
+When we look at the high-GC end (GC > 0.6), the normal sample drops off more sharply, while the tumor sample has a smoother, more gradual slope.
+
+**Conclusion:**  
+Overall, there’s a **similar functional relationship** between GC content and coverage in both samples, which confirms that GC bias is affecting both types of tissue.  
+But the relationship isn’t exactly the same — especially when looking at the height and slope of the curves at the extremes.  
+These differences could come from biological variation or from technical differences in the sequencing process.
+
+
+
+### Q2: Comparing Residuals Between Cancer and Normal Samples
+
+In this part, we are asked to compare the residuals between the two datasets (cancer and normal) after fitting a regression function.  
+Specifically, we want to understand how well the LOESS smoothing fits each dataset and whether the deviations (residuals) show any interesting patterns.  
+We will calculate the residuals for each sample by subtracting the fitted LOESS values from the observed coverage and then compare their distributions both visually (scatter plot) and statistically (summary stats like mean, standard deviation, median, etc.).  
+This will help us see if the variability behaves similarly in the two groups or if one group shows larger or more systematic deviations.
+
+
+```{r, message=FALSE, warning=FALSE}
+library(ggplot2)
+library(dplyr)
+
+# Compute residuals
+df_clean_2.5K <- df_clean_2.5K %>%
+  mutate(
+    Residual = Coverage - Cubic_Fit,
+    Index = row_number()
+  )
+
+df_clean_normal <- df_clean_normal %>%
+  mutate(
+    Residual = Coverage - Cubic_Fit,
+    Index = row_number()
+  )
+
+# Plot for Cancer
+p_cancer <- ggplot(df_clean_2.5K, aes(x = Index, y = Residual)) +
+  geom_point(color = "#990000", alpha = 0.3, size = 0.4) +
+  geom_smooth(method = "loess", se = FALSE, color = "#660000", size = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray30") +
+  coord_cartesian(ylim = c(-100, 100)) +
+  labs(
+    title = "Residuals - Cancer Sample",
+    x = "Bin Index",
+    y = "Residual (Coverage - Spline Fit)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(face = "bold"))
+
+# Plot for Normal
+p_normal <- ggplot(df_clean_normal, aes(x = Index, y = Residual)) +
+  geom_point(color = "#005BBB", alpha = 0.3, size = 0.4) +
+  geom_smooth(method = "loess", se = FALSE, color = "#003F8C", size = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray30") +
+  coord_cartesian(ylim = c(-100, 100)) +
+  labs(
+    title = "Residuals - Normal Sample",
+    x = "Bin Index",
+    y = "Residual (Coverage - Spline Fit)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(face = "bold"))
+
+# Display plots
+p_cancer
+p_normal
+
+
+# Cancer plot: Residuals by GC Content
+p_gc_cancer <- ggplot(df_clean_2.5K, aes(x = GC_Content * 100, y = Residual)) +
+  geom_point(color = "#990000", alpha = 0.3, size = 0.4) +
+  geom_smooth(method = "loess", se = FALSE, color = "#660000", size = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray30") +
+  coord_cartesian(ylim = c(-100, 100)) +
+  labs(
+    title = "Cancer Sample: Residuals by GC Content",
+    x = "GC Content (%)",
+    y = "Residual (Coverage - Spline Fit)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(face = "bold"))
+
+# Normal plot: Residuals by GC Content
+p_gc_normal <- ggplot(df_clean_normal, aes(x = GC_Content * 100, y = Residual)) +
+  geom_point(color = "#005BBB", alpha = 0.3, size = 0.4) +
+  geom_smooth(method = "loess", se = FALSE, color = "#003F8C", size = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray30") +
+  coord_cartesian(ylim = c(-100, 100)) +
+  labs(
+    title = "Normal Sample: Residuals by GC Content",
+    x = "GC Content (%)",
+    y = "Residual (Coverage - Spline Fit)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(face = "bold"))
+
+# Display plots
+p_gc_cancer
+p_gc_normal
+
+```
+
+We compared the residuals from the cancer and normal samples using multiple views: residuals vs bin index, and residuals vs GC content.
+
+Both samples show residuals roughly centered around zero, indicating that the spline fit successfully removed the main GC-related signal. However, the residuals behave differently across the two datasets:
+
+- **Spread**: The residuals in the normal sample are visibly more dispersed, with higher variance and wider vertical scatter. This matches the summary statistics (SD and IQR were higher for the normal sample).
+  
+- **Trend across bins**: The LOESS curve in the cancer sample shows a slight downward drift across bin indices, while in the normal sample it remains relatively stable — suggesting a minor global bias in the cancer sample.
+
+- **Trend across GC content**: In both samples, the residuals appear homoscedastic (constant variance) across GC values, and the smoothed line is flat. This confirms that **GC bias was successfully corrected**, and no systematic residual trend remains as a function of GC content.
+
+
+```{r, message=FALSE, warning=FALSE}
+library(dplyr)
+
+# Combine datasets
+df_stats <- bind_rows(
+  df_clean_2.5K %>% mutate(Sample = "Cancer"),
+  df_clean_normal %>% mutate(Sample = "Normal")
+)
+
+# Summarize residuals
+residual_stats <- df_stats %>%
+  group_by(Sample) %>%
+  summarise(
+    Mean_Residual = mean(Residual, na.rm = TRUE),
+    Median_Residual = median(Residual, na.rm = TRUE),
+    SD_Residual = sd(Residual, na.rm = TRUE),
+    IQR_Residual = IQR(Residual, na.rm = TRUE),
+    Min_Residual = min(Residual, na.rm = TRUE),
+    Max_Residual = max(Residual, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Print the table
+knitr::kable(residual_stats, digits = 2, caption = "Summary Statistics of Residuals by Sample")
+```
+
+
+The summary statistics reveal key differences between the residuals of the cancer and normal samples.  
+Although both have a mean close to zero, indicating no systematic bias, the **normal sample shows higher variability**: both the standard deviation (24.68 vs 19.76) and the IQR (30.55 vs 21.95) are larger.  
+This suggests that the residuals in the normal sample are more spread out.  
+Interestingly, the cancer sample has more extreme outliers, with a minimum of -172.17 and a maximum of 329.73 — compared to -93.37 and 76.23 in the normal.  
+So while the cancer residuals are tighter overall, they include rare but extreme deviations.
+
+
+
+```{r, message=FALSE, warning=FALSE}
+library(ggplot2)
+library(dplyr)
+
+# Recompute residuals for each dataset if not already computed
+df_clean_2.5K$Residual <- df_clean_2.5K$Coverage - df_clean_2.5K$Cubic_Fit
+df_clean_normal$Residual <- df_clean_normal$Coverage - df_clean_normal$Cubic_Fit
+
+# Add sample labels
+df_clean_2.5K$Sample <- "Cancer"
+df_clean_normal$Sample <- "Normal"
+
+# Combine into one dataframe
+df_residuals <- bind_rows(df_clean_2.5K, df_clean_normal)
+
+# Histogram of residuals by group
+ggplot(df_residuals, aes(x = Residual, fill = Sample)) +
+  geom_histogram(position = "identity", alpha = 0.5, bins = 100) +
+  scale_fill_manual(values = c("Cancer" = "red", "Normal" = "blue")) +
+  labs(
+    title = "Overlapping Residual Distributions",
+    subtitle = "After GC bias correction: Cancer (red) vs Normal (blue)",
+    x = "Residual (Coverage - Spline Fit)",
+    y = "Number of Bins",
+    fill = "Sample"
+  ) +
+  coord_cartesian(xlim = c(-150, 150)) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "top"
+  )
+
+```
+
+
+
+The histogram compares the residual distributions for the cancer (red) and normal (blue) samples after correcting for GC bias.  
+Both distributions are roughly centered around zero, which shows that the spline fit did a good job removing most of the GC-related signal.
+
+That said, we can see that the **normal sample has a wider spread**, with more bins at the tails.  
+On the other hand, the **cancer sample is more tightly clustered** near zero, which suggests lower noise and possibly a slightly better fit.
+
+Overall, this visual comparison backs up the idea that while both models work pretty well, the normal sample shows a bit more variability in coverage, likely due to higher noise or technical factors.
+
+**In summary:**  
+Both models effectively corrected for GC bias. The cancer sample ended up with tighter residuals (though with some rare extreme points), while the normal sample showed broader residual variability, hinting at more noise or technical variation.
+
+
+
+
+**One thing We've learned**: Even after GC bias correction, residual patterns can differ across samples, revealing important differences in variability, noise levels, and model fit quality between biological conditions.
+

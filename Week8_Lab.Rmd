@@ -1,0 +1,915 @@
+---
+title: "HW8"
+author: "Omer Abuhatzira, Eden Malka, Salome Baranes"
+date: "2025-06-06"
+output:
+  html_document: default
+  word_document: default
+---
+
+Group members:
+
+ - Omer Abuhazira 319119988 omer.abuhatzira@mail.huji.ac.il
+ - Eden Malka 318849940 eden.malka@mail.huji.ac.il
+ - Salome Baranes 209891183 salome.baranes@mail.huji.ac.il
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Libraries used
+
+```{r libraries, message=FALSE, warning=FALSE}
+
+library(data.table)    
+library(dplyr)     
+library(ggplot2)      
+library(splines)        
+library(tidyr) 
+library(patchwork)  
+
+```
+
+
+### Paths and Data - Data Preparation
+
+```{r paths, message=FALSE, warning=FALSE}
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(splines)
+
+# Load chromosome 1 sequence from 5 parts 
+load_rda_string <- function(path) {
+  obj_name <- load(path)
+  get(obj_name)
+}
+
+s1 <- load_rda_string("C:/Users/97250/Downloads/chr1_str_0M_50M.rda")
+s2 <- load_rda_string("C:/Users/97250/Downloads/chr1_str_50M_100M.rda")
+s3 <- load_rda_string("C:/Users/97250/Downloads/chr1_str_100M_150M.rda")
+s4 <- load_rda_string("C:/Users/97250/Downloads/chr1_str_150M_200M.rda")
+s5 <- load_rda_string("C:/Users/97250/Downloads/chr1_str_200M_end.rda")
+
+chr1_seq <- paste0(s1, s2, s3, s4, s5)
+chr1_full <- strsplit(chr1_seq, "")[[1]]  # full sequence
+
+```
+
+
+
+### Introduction
+
+In this lab, we explored different ways to estimate copy number variation (CNV) from sequencing data using coverage and GC content information. Starting from cleaned data of tumor and normal samples, we revisited the GC bias correction we implemented in Lab 7 and applied it to compare multiple models.
+
+We focused on specific regions of chromosome 1 (like 25M–30M and 75M–80M), and created visualizations to analyze how well each model captured potential CNV signals. Along the way, we learned how normalization, GC correction, and comparison to normal samples each impact the reliability of the copy number estimates.
+
+
+### Before we start:
+
+To start this part of the lab, we reconstructed the full chromosome 1 sequence by loading five `.rda` files and combining them into a single character vector of bases. Using this, we calculated GC content and coverage across 5K bins for both the tumor and normal samples based on their read mapping files. We then built a general function that outputs a clean data frame with these values. Building on what we did in Lab 7, we added several improvements: we filtered out noisy bins using LOESS smoothing and IQR thresholds, removed the top 2% of extreme residuals, and fitted a cubic spline with five knots to estimate the expected coverage function \( f(gc) \).
+
+Finally, we used that to compute the estimated copy number per bin \( a_i = \frac{Y_i}{f(gc_i)} \). This entire process was done separately for each sample to account for differences in GC bias, and now we’re ready to begin the comparative analysis.
+
+
+```{r,message=FALSE, warning=FALSE}
+
+# General function: load reads and compute GC + Coverage 
+prepare_raw_gc_coverage <- function(reads_file, chr1_full, bin_size = 5000, sample_label = "Sample") {
+  reads <- fread(reads_file)
+  colnames(reads) <- c("Chrom", "Loc", "FragLen")
+  
+  n_bins <- floor(length(chr1_full) / bin_size)
+  breaks <- c(seq(0, length(chr1_full) + bin_size, by = bin_size))
+  
+  coverage <- hist(reads$Loc, breaks = breaks, plot = FALSE)$counts[1:n_bins]
+  GC_per_bin <- sapply(1:n_bins, function(i) {
+    bin <- chr1_full[((i - 1) * bin_size + 1):(i * bin_size)]
+    sum(bin %in% c("G", "C")) / bin_size
+  })
+  
+  data.frame(
+    Bin = seq_len(n_bins),
+    Coverage = coverage,
+    GC_Content = GC_per_bin,
+    Cell_Size = bin_size,
+    Sample = sample_label
+  )
+}
+
+# Process sample: clean + spline + compute aᵢ 
+process_sample <- function(df_raw) {
+  df <- df_raw %>%
+    filter(GC_Content >= 0.3, Coverage > 0)
+  
+  # LOESS fit
+  loess_fit <- loess(Coverage ~ GC_Content, data = df, span = 0.5)
+  df$LOESS_Fit <- predict(loess_fit)
+  df$Residual <- df$Coverage - df$LOESS_Fit
+  
+  # IQR filtering
+  iqr_val <- IQR(df$Residual, na.rm = TRUE)
+  q1 <- quantile(df$Residual, 0.25, na.rm = TRUE)
+  q3 <- quantile(df$Residual, 0.75, na.rm = TRUE)
+  lower_bound <- q1 - 3.25 * iqr_val
+  upper_bound <- q3 + 3.25 * iqr_val
+  df <- df %>% filter(Residual >= lower_bound, Residual <= upper_bound)
+  
+  # Remove top 2% of absolute residuals
+  threshold <- quantile(abs(df$Residual), 0.98)
+  df <- df %>% filter(abs(Residual) <= threshold)
+  
+  # Fit spline
+  knots_gc <- quantile(df$GC_Content, probs = seq(0.2, 0.8, length.out = 5))
+  fit <- lm(Coverage ~ bs(GC_Content, knots = knots_gc, degree = 3), data = df)
+  f_fun <- function(gc) {
+    pmax(predict(fit, newdata = data.frame(GC_Content = gc)), 0)
+  }
+  
+  # Compute aᵢ
+  df <- df %>%
+    mutate(
+      f_hat = f_fun(GC_Content),
+      a_i = Coverage / f_hat
+    )
+  
+  return(df)
+}
+
+# Run for tumor and normal samples 
+tumor_raw <- prepare_raw_gc_coverage(
+  reads_file = "C:/Users/97250/Downloads/TCGA-13-0723-01A_lib1_all_chr1.forward",
+  chr1_full = chr1_full,
+  bin_size = 5000,
+  sample_label = "Tumor"
+)
+
+normal_raw <- prepare_raw_gc_coverage(
+  reads_file = "C:/Users/97250/Downloads/TCGA-13-0723-10B_lib1_all_chr1.forward",
+  chr1_full = chr1_full,
+  bin_size = 5000,
+  sample_label = "Normal"
+)
+
+# Clean and compute aᵢ 
+tumor_df <- process_sample(tumor_raw)
+normal_df <- process_sample(normal_raw)
+
+# Combine for further analysis 
+combined_df <- bind_rows(tumor_df, normal_df)
+
+# Summary 
+cat(
+    "- Tumor bins:", nrow(tumor_df), "\n",
+    "- Normal bins:", nrow(normal_df), "\n",
+    "- Combined range of aᵢ:", round(range(combined_df$a_i), 2), "\n")
+
+```
+After running the full preprocessing pipeline on both the tumor and normal datasets, we ended up with around 42,000 clean bins in each sample, which gives us a detailed view of chromosome 1 with high resolution.
+
+The estimated copy numbers \( a_i \) ranged from 0.28 to 1.6, which makes sense biologically—most values are centered near 1, as expected for diploid regions, but we also see lower and higher values that could reflect real deletions or amplifications, especially in the tumor sample. 
+
+This step was super important because now we have clean data that’s been corrected for GC bias in a sample-specific way, and for every bin we know how much the actual coverage deviates from what we’d expect based on its GC content.
+
+We also merged the two datasets into one combined data frame (`combined_df`) so we can compare the tumor and normal samples side by side in upcoming analyses, like plotting copy number along specific genomic regions or checking for patterns of change between the two. Overall, we’re now fully ready to dive into the comparison stage.
+
+
+
+### GC Effect on Coverage (After Median Normalization)
+
+Before diving into model comparisons, we first looked at how coverage depends on GC content in each sample.  
+To make the tumor and normal samples comparable on the same scale, we **normalized the normal sample’s coverage** so that its **median matches the tumor’s**.  
+This adjustment lets us focus on the *shape* of the GC bias without being misled by differences in overall sequencing depth.
+
+
+
+```{r, message=FALSE, warning=FALSE}
+
+
+library(ggplot2)
+library(dplyr)
+
+# Calculate median coverage for tumor and normal
+tumor_median <- median(tumor_raw$Coverage, na.rm = TRUE)
+normal_median <- median(normal_raw$Coverage, na.rm = TRUE)
+
+# Compute normalization factor
+normalization_factor <- tumor_median / normal_median
+
+# Adjust normal coverage by multiplying with the factor
+combined_df <- combined_df %>%
+  mutate(Coverage_adj = ifelse(Sample == "Normal", Coverage * normalization_factor, Coverage))
+
+# Plot adjusted LOESS smoothed coverage vs GC
+ggplot(combined_df, aes(x = GC_Content, y = Coverage_adj)) +
+  geom_point(aes(color = Sample), alpha = 0.3, size = 0.7) +
+  geom_smooth(data = combined_df %>% filter(Sample == "Tumor"),
+              aes(x = GC_Content, y = Coverage_adj),
+              method = "loess", se = FALSE, span = 0.4,
+              color = "#e41a1c", size = 1.2) +
+  geom_smooth(data = combined_df %>% filter(Sample == "Normal"),
+              aes(x = GC_Content, y = Coverage_adj),
+              method = "loess", se = FALSE, span = 0.4,
+              color = "black", size = 1.2) +
+  scale_color_manual(values = c("Tumor" = "#e41a1c", "Normal" = "#377eb8")) +
+  labs(
+    title = "GC Effect on Coverage (After Median Normalization)",
+    subtitle = "LOESS curves aligned to tumor coverage scale",
+    x = "GC Content",
+    y = "Normalized Coverage",
+    color = "Sample"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "top"
+  )
+
+
+
+```
+
+
+
+The updated plot shows that both samples follow a similar GC bias trend:  
+coverage increases with GC content up to around 0.5–0.55 and then drops.  
+After aligning their medians, we see that the **tumor sample still has higher normalized coverage**, especially in GC-rich regions.  
+
+This suggests that even after adjusting for sequencing depth,  
+there are likely **real biological differences** between the samples — possibly due to true copy number variation.  
+It also reinforces why **GC correction is so important** in downstream CNV analysis.
+
+
+### Part A : Visual Comparison of Models A–D
+
+### Model A – No GC Correction, Tumor Only
+
+For model A, we analyzed the tumor sample without applying any GC correction. We focused on two specific genomic regions: 25M–30M and 75M–80M on chromosome 1. To visualize them together, we extracted the coverage values for each bin, normalized them by dividing by the median coverage within their respective region, and then combined the two regions into a single continuous plot.
+
+We also added a dashed vertical line to clearly separate the two regions within the same plot. This way, we can easily compare the two regions side by side and look for potential shifts that may suggest copy number alterations, even before applying any GC-related bias correction.
+
+
+```{r,fig.width=12, fig.height=4, message=FALSE, warning=FALSE}
+
+# Define bin indices for selected regions 
+region1_bins <- 10001:12000  # for 25M–30M
+region2_bins <- 30001:32000  # for 75M–80M
+
+# Filter and combine regions from the cleaned combined_df
+region1_df <- combined_df %>% filter(Bin %in% region1_bins)
+region2_df <- combined_df %>% filter(Bin %in% region2_bins)
+
+# Combine both and label the regions
+analysis_df <- bind_rows(region1_df, region2_df) %>%
+  mutate(Region = ifelse(Bin %in% region1_bins, "25M–30M", "75M–80M"))
+
+
+library(ggplot2)
+library(dplyr)
+
+# Prepare single continuous index across both regions
+model_a_single_plot <- analysis_df %>%
+  filter(Sample == "Tumor") %>%
+  filter(Bin %in% c(region1_bins, region2_bins)) %>%
+  mutate(
+    Region = ifelse(Bin %in% region1_bins, "25M-30M", "75M-80M")
+  ) %>%
+  group_by(Region) %>%
+  mutate(
+    Index = row_number(),
+    Region_Median = median(Coverage),
+    Norm_Coverage = Coverage / Region_Median
+  ) %>%
+  ungroup() %>%
+  mutate(Combined_Index = ifelse(Region == "25M-30M", Index, Index + max(Index)))
+
+# Calculate position to place vertical separation line
+sep_position <- max(model_a_single_plot$Index)
+
+# Plot
+ggplot(model_a_single_plot, aes(x = Combined_Index, y = Norm_Coverage)) +
+  geom_point(color = "#e31a1c", alpha = 0.4, size = 0.8) +
+  geom_vline(xintercept = sep_position, linetype = "dashed", color = "gray50") +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "black") +
+  annotate("text", x = sep_position / 2, y = 2.2, label = "25M–30M", size = 5, fontface = "bold") +
+  annotate("text", x = sep_position + max(model_a_single_plot$Index) / 2, y = 2.2, label = "75M–80M", size = 5, fontface = "bold") +
+  labs(title = "Model A: Tumor Sample – No GC Correction (Single Plot)",
+       x = "Bin index (both regions concatenated)",
+       y = "Coverage / Region Median") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+
+```
+
+
+The plot shows normalized coverage values across both regions of the tumor sample. The y-axis represents the coverage divided by the median coverage in each region, so a value of 1 indicates expected diploid-level coverage.
+
+We observe that the 25M–30M region (left side of the plot) has a relatively tight and stable distribution around 1, whereas the 75M–80M region (right side) shows a broader spread, with many bins deviating above and below the baseline.
+
+This increased variability might reflect biological events such as amplifications or deletions, or it could be due to technical artifacts. 
+
+Since no GC correction was applied yet, some of the noise may still be GC-related. The next model applies GC correction to address this.
+
+
+### Model B - Distribution of f(GC)
+
+Before jumping into the main plots of model B, we wanted to understand and address a technical issue we observed:  
+In both genomic regions, the values of \( \hat{a}_i \) tend to be more scattered at the **edges** — meaning the start and end of each region look noisier and more extreme.
+
+It’s because the GC correction function \( f(\text{GC}) \), which we use to normalize coverage, becomes **very small** when GC content is either too low or too high.  
+And since \( \hat{a}_i = \frac{\text{Coverage}}{f(\text{GC})} \), dividing by small values can **inflate minor fluctuations** in coverage, even when the actual copy number is stable.
+
+To fix that, we decided to **remove bins where \( f(\text{GC}) \) is too low**
+
+```{r,message=FALSE, warning=FALSE}
+
+# Prepare data for the two regions (25M–30M and 75M–80M)
+model_b_df <- combined_df %>%
+  filter(Sample == "Tumor", Bin %in% c(region1_bins, region2_bins)) %>%
+  mutate(
+    Region = ifelse(Bin %in% region1_bins, "25M–30M", "75M–80M")
+  ) %>%
+  group_by(Region) %>%
+  mutate(Index = row_number()) %>%
+  ungroup() %>%
+  mutate(Combined_Index = ifelse(Region == "25M–30M", Index, Index + max(Index)))
+
+ggplot(model_b_df, aes(x = f_hat)) +
+  geom_histogram(bins = 100, fill = "steelblue", color = "white") +
+  geom_vline(xintercept = 200, color = "red", linetype = "dashed") +
+  labs(title = "Distribution of f(GC)", x = "Predicted f(GC)", y = "Count") +
+  theme_minimal()
+
+```
+
+
+Most bins have predicted \( f(\text{GC}) \) values above 200,  
+but we can see a **long left tail** of lower values in the distribution.  
+These low values correspond to bins at the **extremes of GC content**, where the predicted coverage is less reliable.  
+We chose a threshold of **200** (shown as a red dashed line) to **filter out these unstable regions** —
+this cutoff helps reduce noise from extreme GC areas while still keeping the majority of informative bins.
+
+### Model B: GC-Corrected Copy Number Estimation (Tumor Only)
+
+Before plotting, we computed \( \hat{a}_i = \frac{Y_i}{f(\text{GC}_i)} \) for the **tumor sample only**, using a GC-bias correction function estimated by a cubic spline. This allows us to normalize coverage values and detect potential copy number variation. We focused on two genomic regions (25M–30M and 75M–80M), plotted together with a dashed vertical line separating them.
+
+We also noticed that bins with very low predicted coverage \( f(\text{GC}) \)—especially at the GC extremes—produced noisy and inflated values of \( \hat{a}_i \). This happens because dividing by small predicted values amplifies random fluctuations in raw coverage.
+
+To handle this, we **filtered out bins where \( f(\text{GC}) < 200 \)**, based on the histogram distribution, and re-plotted the data in a zoomed-in view.
+
+
+
+```{r,fig.width=10, fig.height=6, message=FALSE, warning=FALSE}
+
+library(ggplot2)
+library(dplyr)
+library(patchwork)  
+
+# Prepare data for the two regions (25M–30M and 75M–80M)
+model_b_df <- combined_df %>%
+  filter(Sample == "Tumor", Bin %in% c(region1_bins, region2_bins)) %>%
+  mutate(
+    Region = ifelse(Bin %in% region1_bins, "25M–30M", "75M–80M")
+  ) %>%
+  group_by(Region) %>%
+  mutate(Index = row_number()) %>%
+  ungroup() %>%
+  mutate(Combined_Index = ifelse(Region == "25M–30M", Index, Index + max(Index)))
+
+# Define the separation line between regions in the plot
+sep_position_b <- max(model_b_df$Index)
+
+# Full plot including all bins
+p1 <- ggplot(model_b_df, aes(x = Combined_Index, y = a_i)) +
+  geom_point(color = "#e31a1c", alpha = 0.4, size = 0.8) +
+  geom_vline(xintercept = sep_position_b, linetype = "dashed", color = "gray50") +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "black") +
+  annotate("text", x = sep_position_b / 2, y = 2.2, label = "25M–30M", size = 5, fontface = "bold") +
+  annotate("text", x = sep_position_b + max(model_b_df$Index) / 2, y = 2.2, label = "75M–80M", size = 5, fontface = "bold") +
+  labs(title = "Model B: Tumor Sample – GC-Corrected (aᵢ)",
+       x = "Bin index (both regions concatenated)",
+       y = expression(a[i] ~ "=" ~ "Coverage / f(GC)")) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+# Filter bins where predicted f(GC) is too low
+threshold_f_hat <- 200  # Manually chosen threshold
+
+model_b_filtered <- model_b_df %>%
+  filter(f_hat >= threshold_f_hat)
+
+# Zoom-in plot after filtering edge bins
+p2 <- ggplot(model_b_filtered, aes(x = Combined_Index, y = a_i)) +
+  geom_point(color = "#e31a1c", alpha = 0.4, size = 0.8) +
+  geom_vline(xintercept = sep_position_b, linetype = "dashed", color = "gray50") +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "black") +
+  annotate("text", x = sep_position_b / 2, y = 2.2, label = "25M–30M", size = 5, fontface = "bold") +
+  annotate("text", x = sep_position_b + max(model_b_filtered$Index) / 2, y = 2.2, label = "75M–80M", size = 5, fontface = "bold") +
+  labs(title = "Model B: Tumor Sample – GC-Corrected (Zoom-In)",
+       subtitle = "Filtered bins with low predicted f(GC)",
+       x = "Bin index (filtered)",
+       y = expression(a[i] ~ "=" ~ "Coverage / f(GC)")) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5)
+  )
+
+# Combine both plots (full and filtered)
+p1 / p2
+
+# Evaluate proportion of aᵢ values within ±10% of expected value (1)
+within_10pct_before <- mean(abs(model_b_df$a_i - 1) < 0.1, na.rm = TRUE)
+within_10pct_after <- mean(abs(model_b_filtered$a_i - 1) < 0.1, na.rm = TRUE)
+
+cat("Proportion of bins with aᵢ within ±10% of 1:\n",
+    "- Before filtering: ", round(within_10pct_before, 3), "\n",
+    "- After filtering:  ", round(within_10pct_after, 3), "\n")
+
+
+
+```
+
+
+The first plot shows the full GC-corrected \( \hat{a}_i \) values across both regions. Most points hover around the expected baseline of 1, but there’s more scatter at the edges.
+
+In the second (zoomed-in) plot, we removed bins with low predicted \( f(\text{GC}) \), which cleaned up some of the noisy outliers and made the pattern more stable.  
+
+This small change slightly improved accuracy — the proportion of bins with \( \hat{a}_i \) within ±10% of 1 increased from **0.701** to **0.718**.  
+That suggests our GC correction worked well, and this extra filtering helped reduce noise from problematic bins at GC extremes.
+
+When comparing the two regions, we originally suspected a subtle dip in the 25M–30M range. But after filtering, both regions show **very similar spread and variability**, centered around 1.  
+This suggests that either there’s no strong copy number change in these regions, or the signal is too subtle to detect confidently in this model.
+
+### Model C – No GC Correction, Tumor vs Normal Comparison
+
+To compare tumor and normal samples without GC correction, we normalized coverage within each region by its median and computed the per-bin ratio: Tumor / Normal.
+
+This helps us directly assess differences between the samples across two genomic regions (25M–30M and 75M–80M).
+
+
+```{r,fig.width=12, fig.height=4, message=FALSE, warning=FALSE}
+
+library(dplyr)
+library(ggplot2)
+library(tidyr)  # for spread
+
+# Filter for the relevant bins and define the region label
+region_df <- combined_df %>%
+  filter(Bin %in% c(region1_bins, region2_bins)) %>%
+  mutate(Region = ifelse(Bin %in% region1_bins, "25M–30M", "75M–80M"))
+
+# Normalize coverage by regional median within each sample and region
+norm_df <- region_df %>%
+  group_by(Sample, Region) %>%
+  mutate(Region_Median = median(Coverage),
+         Norm_Coverage = Coverage / Region_Median) %>%
+  ungroup()
+
+# Reshape to wide format using spread instead of pivot_wider
+ratio_df <- norm_df %>%
+  select(Bin, Region, Sample, Norm_Coverage) %>%
+  spread(key = Sample, value = Norm_Coverage) %>%
+  mutate(Ratio = Tumor / Normal) %>%
+  arrange(Bin) %>%
+  group_by(Region) %>%
+  mutate(Index = row_number(),
+         Combined_Index = ifelse(Region == "25M–30M", Index, Index + max(Index))) %>%
+  ungroup()
+
+# Separator position between regions
+sep_position_c <- max(ratio_df$Index)
+
+
+# Plotting the ratio 
+ggplot(ratio_df, aes(x = Combined_Index, y = Ratio)) +
+  geom_point(alpha = 0.6, color = "#6a3d9a") +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "black") +
+  geom_vline(xintercept = sep_position_c, linetype = "dashed", color = "gray50") +
+  annotate("text", x = sep_position_c / 2, y = 2.1, 
+           label = "25M–30M", size = 5, fontface = "bold") +
+  annotate("text", x = sep_position_c + max(ratio_df$Index) / 2, y = 2.1, 
+           label = "75M–80M", size = 5, fontface = "bold") +
+  labs(title = "Model C: Tumor / Normal – No GC Correction (Ratio of Normalized Coverage)",
+       x = "Bin index (both regions concatenated)",
+       y = "Tumor / Normal (per-bin ratio)") +
+  coord_cartesian(ylim = c(0.5, 2.2)) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+```
+
+
+The plot shows the ratio of tumor to normal coverage for each bin, after we normalized both samples by their median coverage. Most values cluster around 1, meaning the tumor and normal coverages are roughly similar in many places — which is what we expect in regions without copy number changes.
+
+Still, we see quite a bit of spread, especially in the 75M–80M region. Some bins drop below 0.75 or go above 1.5, which could reflect copy number variation (like deletions or amplifications in the tumor) — or just technical noise.
+
+One important thing to remember is that we didn’t apply GC correction in this model, so some of the variation we’re seeing might still be caused by GC bias rather than real biological differences.
+
+
+### Model D – GC Correction for Both Tumor and Normal Samples
+
+In model D, we directly compared the GC-corrected values of the tumor and normal samples to estimate the relative copy number per bin. This was done by computing the ratio between their normalized coverages, with an added stabilizing constant \( c \) to prevent division by very small numbers.
+
+We focused again on the same two regions, combining them into a single plot and using color to distinguish between them.
+
+This approach helps reduce technical biases and provides a clearer picture of actual copy number alterations in the tumor relative to the normal baseline.
+
+
+```{r,fig.width=12, fig.height=4, message=FALSE, warning=FALSE}
+library(ggplot2)
+library(dplyr)
+
+# Set stabilizing constant
+c_val <- 0.1  
+
+# Join tumor and normal by Bin
+tumor_ai <- combined_df %>%
+  filter(Sample == "Tumor", Bin %in% c(region1_bins, region2_bins)) %>%
+  select(Bin, Coverage, GC_Content, f_hat, a_i) %>%
+  rename(
+    Coverage_T = Coverage,
+    f_T = f_hat,
+    a_T = a_i
+  )
+
+normal_ai <- combined_df %>%
+  filter(Sample == "Normal", Bin %in% c(region1_bins, region2_bins)) %>%
+  select(Bin, Coverage, f_hat, a_i) %>%
+  rename(
+    Coverage_N = Coverage,
+    f_N = f_hat,
+    a_N = a_i
+  )
+
+# Merge and compute stabilized a_i ratio
+model_d_df <- inner_join(tumor_ai, normal_ai, by = "Bin") %>%
+  mutate(
+    Region = ifelse(Bin %in% region1_bins, "25M–30M", "75M–80M"),
+    ai_ratio = (Coverage_T / f_T + c_val) / (Coverage_N / f_N + c_val)
+  ) %>%
+  group_by(Region) %>%
+  mutate(Index = row_number()) %>%
+  ungroup() %>%
+  mutate(Combined_Index = ifelse(Region == "25M–30M", Index, Index + max(Index)))
+
+# Vertical separator
+sep_position_d <- max(model_d_df$Index)
+
+# Plot
+ggplot(model_d_df, aes(x = Combined_Index, y = ai_ratio)) +
+  geom_point(color = "#984ea3", alpha = 0.4, size = 0.8) +
+  geom_vline(xintercept = sep_position_d, linetype = "dashed", color = "gray50") +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "black") +
+  annotate("text", x = sep_position_d / 2, y = 2.3, label = "25M–30M", size = 5, fontface = "bold") +
+  annotate("text", x = sep_position_d + max(model_d_df$Index) / 2, y = 2.3, label = "75M–80M", size = 5, fontface = "bold") +
+  labs(title = "Model D: Tumor vs Normal – GC Corrected Ratio (aᵢ)",
+       x = "Bin index (both regions concatenated)",
+       y = expression(hat(a)[i] ~ " Tumor / Normal"),
+       subtitle = paste0("Stabilizing constant c = ", c_val)) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5)
+  )
+
+
+
+```
+
+
+This plot shows the GC-corrected copy number ratio between the tumor and normal samples across the two regions. Each point represents a bin, and the values are computed as the ratio between the normalized coverages (coverage divided by GC-bias function), with a small stabilizing constant \( c = 0.1 \) added to both numerator and denominator
+
+In the 25M–30M region, we observe a consistent drop below 1, suggesting a possible deletion or loss of material in the tumor relative to the normal baseline. In contrast, the 75M–80M region is more stable and hovers around the expected value of 1, with relatively low variability. This model provides the clearest and most biologically meaningful view of potential copy number alterations in the tumor sample.
+
+Unlike Model B, because of the stabilization \( c = 0.1 \) , we do **not** need to filter out bins based on low predicted \( f(\text{GC}) \) like we did in Model B. The constant effectively prevents noisy amplification, and we can see in the plot that the spread remains well-controlled across the full GC range.
+
+
+### Part B: Numerical Evaluation of Copy Number Estimates
+
+In this part of the lab, we aimed to **quantify the accuracy of copy number estimation** in a specific genomic region — **26.5M to 27.0M** on chromosome 1 — where we suspect the number of copies is **less than 2**.  
+We evaluated three models:
+
+- **Model A**: Raw tumor coverage
+- **Model B**: Tumor only, with GC correction  
+- **Model C**: Tumor vs. Normal, no correction  
+- **Model D**: Tumor vs. Normal, with GC correction  
+
+Our goal was to compute the **median \( a_i \)** in this region. If the model successfully captures the copy number loss, the median should be **noticeably below 1**.
+
+
+
+
+```{r, message=FALSE, warning=FALSE}
+
+# Construct model A: Raw tumor coverage 
+model_a_df <- combined_df %>%
+  filter(Sample == "Tumor", Bin %in% c(region1_bins, region2_bins)) %>%
+  mutate(a_i = Coverage / median(Coverage, na.rm = TRUE)) %>%
+  select(Bin, a_i)
+
+# Construct model B: Tumor only with GC correction
+model_b_df <- combined_df %>%
+  filter(Sample == "Tumor", Bin %in% c(region1_bins, region2_bins)) %>%
+  select(Bin, Coverage, f_hat) %>%
+  mutate(a_i = Coverage / f_hat)
+
+# Construct model C: Tumor vs normal, no GC correction
+model_c_df <- combined_df %>%
+  filter(Sample %in% c("Tumor", "Normal"),
+         Bin %in% c(region1_bins, region2_bins)) %>%
+  select(Bin, Sample, Coverage) %>%
+  pivot_wider(names_from = Sample, values_from = Coverage) %>%
+  mutate(a_i = Tumor / Normal)
+
+# Construct model D: Tumor vs normal, with GC correction
+model_d_df <- combined_df %>%
+  filter(Sample %in% c("Tumor", "Normal"),
+         Bin %in% c(region1_bins, region2_bins)) %>%
+  select(Bin, Sample, Coverage, f_hat) %>%
+  pivot_wider(names_from = Sample, values_from = c(Coverage, f_hat)) %>%
+  mutate(ai_ratio = (Coverage_Tumor / f_hat_Tumor + 0.1) / 
+                    (Coverage_Normal / f_hat_Normal + 0.1))
+
+# Define region of interest: 26.5M–27.0M
+region_bins <- 10601:10800
+
+# Extract relevant bins for each model
+region_a <- model_a_df %>% filter(Bin %in% region_bins)
+region_b <- model_b_df %>% filter(Bin %in% region_bins)
+region_c <- model_c_df %>% filter(Bin %in% region_bins)
+region_d <- model_d_df %>% filter(Bin %in% region_bins)
+
+# Compute median aᵢ values for each model
+median_a <- round(median(region_a$a_i, na.rm = TRUE), 3)
+median_b <- round(median(region_b$a_i, na.rm = TRUE), 3)
+median_c <- round(median(region_c$a_i, na.rm = TRUE), 3)
+median_d <- round(median(region_d$ai_ratio, na.rm = TRUE), 3)
+
+# Print summary to console
+cat("Median aᵢ in 26.5–27.0M region:\n",
+    "- Model A (Raw Tumor Coverage):", median_a, "\n",
+    "- Model B (Tumor only, GC-corrected):", median_b, "\n",
+    "- Model C (Tumor vs Normal, no correction):", median_c, "\n",
+    "- Model D (Tumor/Normal ratio, GC-corrected):", median_d, "\n")
+
+# Plot aᵢ values from Model D in the selected region
+ggplot(model_d_df %>% filter(Bin %in% region_bins), aes(x = Bin, y = ai_ratio)) +
+  geom_point(color = "purple", alpha = 0.6, size = 1.2) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "black") +
+  labs(
+    title = expression("Model D: Copy Number Ratio in Region 26.5M–27.0M"),
+    x = "Bin Index",
+    y = expression(hat(a)[i])
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.title = element_text(face = "bold")
+  )
+
+```
+
+
+
+### Suggesting a Numerical Metric to Evaluate Copy Number Estimation Accuracy
+
+Although the question refers to an assumed deletion near position 26.8M on chromosome 1 (i.e., where \( A < 1 \)), our analysis of the region **26.5M–27.0M** showed that the median estimated copy number \( \hat{a}_i \) was actually slightly above 1 
+This suggests that in our specific sample, there's no strong indication of copy number loss in this region.
+
+Nonetheless, we used this region to compare the performance of Models B, C, and D by computing the **median** \( \hat{a}_i \) as a numerical indicator of deviation from diploidy.  
+We chose the **median** because it is a **robust statistic** that’s less affected by extreme values or random noise, which often appear in sequencing data like this. Compared to the mean, the median provides a more **stable and representative measure** of central tendency in noisy regions, making it more suitable for comparing model outputs in this context.
+
+Here are the median \( a_i \) values we observed:
+
+- **Model A**: 1.169 
+- **Model B**: 1.030  
+- **Model C**: 1.017  
+- **Model D**: 1.014  
+
+All the medians are slightly above 1, indicating that **none of the models showed strong evidence for a copy number loss** in this region.  
+We can also see this in the plot above, where most points are slightly above the baseline and there’s no clear drop around 26.8M.
+
+This suggests that, in our specific sample, the assumed deletion (A < 1) is either not present or not detectable using the current methods.  
+Still, **Model D** produced the lowest median, reflecting a small but consistent shift that may point to improved sensitivity.
+
+In addition to using the median as a summary statistic, we also propose an alternative quantitative metric:  
+the proportion of bins where the estimated copy number \( \hat{a}_i \) falls within a narrow window around 1.  
+Because we didn’t see strong evidence for a deletion around 26.8M (all models had medians slightly above 1),  
+we chose to calculate the proportion of bins where \( \hat{a}_i \) falls between 0.9 and 1.1 — instead of looking at values below 0.9.  
+This gives us a simple way to check how well each model keeps diploid regions stable, without being too noisy or overcorrected.  
+A higher proportion means the model gives more accurate and consistent results in regions with no copy number change.
+
+
+```{r, message=FALSE, warning=FALSE}
+# Prepare region-specific data frames for consistency
+region_b_prop <- region_b %>%
+  mutate(Model = "Model B", ai = a_i) %>%
+  select(Bin, ai, Model)
+
+region_c_prop <- region_c %>%
+  mutate(Model = "Model C", ai = a_i) %>%
+  select(Bin, ai, Model)
+
+region_d_prop <- region_d %>%
+  mutate(Model = "Model D", ai = ai_ratio) %>%
+  select(Bin, ai, Model)
+
+# Combine all into one dataframe
+region_models_df <- bind_rows(region_b_prop, region_c_prop, region_d_prop)
+
+# Compute proportion of ai values between 0.9 and 1.1
+proportion_within_range <- region_models_df %>%
+  filter(!is.na(ai)) %>%
+  group_by(Model) %>%
+  summarize(
+    Total = n(),
+    WithinRange = sum(ai >= 0.9 & ai <= 1.1),
+    Proportion = round(WithinRange / Total, 3)
+  )
+
+# Print result
+print(proportion_within_range)
+
+```
+
+We can see that **Model D** has the highest accuracy (74.9%), closely followed by **Model B** (73.5%).  
+**Model C** shows the lowest proportion (48.2%).  
+This reinforces that **Model D** provides the most stable and reliable copy number estimates in the selected region (26.5M–27.0M), capturing diploid values with minimal deviation.
+
+### Part C: Comparing Estimation Methods – Models B, C, and D
+
+Each of the three models (B, C, and D) provides a different way to estimate copy number variation, and we can clearly see the differences in both the histograms and violin plots.
+
+**Model B** uses only the tumor sample, applying GC correction to adjust for bias. It doesn’t require a matched normal, which makes it simpler to use. The estimates are fairly centered around 1, and the distribution is quite symmetric. However, this model might still miss shared technical effects that exist in both samples, like mappability issues or artifacts that GC correction alone can't fully fix.
+
+**Model C** compares tumor and normal directly, without any GC correction. The idea is that shared technical noise will cancel out. In practice though, the lack of GC correction leads to more variability, especially in regions with extreme GC content. This was clear in both regions we looked at — the estimates were much more spread out and less stable compared to the other models.
+
+**Model D** combines both strategies: it applies GC correction to both tumor and normal, and then takes the ratio between them. This approach gave us the most accurate and consistent results overall. The estimates were tightly clustered around 1, and the distribution was symmetric and narrow in both regions. Model D does depend on having a good GC correction fit for both samples, but in our case, it clearly outperformed the others in terms of stability.
+
+In summary, while all three models aim to estimate copy number, **Model D** provided the most reliable and stable estimates.  
+**Model B** was simple and fairly accurate but didn’t handle all sources of noise.  
+**Model C** showed the most variation and is probably less reliable unless GC correction is added.  
+Based on the plots and median values, **Model D is the preferred method** for consistent copy number estimation.
+
+###  histogram of aᵢ across models
+
+
+```{r,fig.width=12, fig.height=6, message=FALSE, warning=FALSE}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(patchwork)  
+
+# Step 1: Normalize tumor and normal (for Model C)
+norm_df <- combined_df %>%
+  filter(Bin %in% c(region1_bins, region2_bins)) %>%
+  mutate(Region = ifelse(Bin %in% region1_bins, "25M–30M", "75M–80M")) %>%
+  group_by(Sample, Region) %>%
+  mutate(Norm_Coverage = Coverage / median(Coverage, na.rm = TRUE)) %>%
+  ungroup()
+
+model_c_df <- norm_df %>%
+  select(Bin, Region, Sample, Norm_Coverage) %>%
+  pivot_wider(names_from = Sample, values_from = Norm_Coverage) %>%
+  mutate(ai = Tumor / Normal, Model = "Model C") %>%
+  filter(!is.na(ai)) %>%
+  select(Bin, Region, ai, Model)
+
+# Prepare Model B and D using original (non-selected) data
+model_b_filtered <- combined_df %>%
+  filter(Sample == "Tumor", Bin %in% c(region1_bins, region2_bins)) %>%
+  mutate(
+    Model = "Model B",
+    Region = ifelse(Bin %in% region1_bins, "25M–30M", "75M–80M"),
+    ai = Coverage / f_hat
+  ) %>%
+  select(Bin, Region, ai, Model)
+
+model_d_filtered <- combined_df %>%
+  filter(Bin %in% c(region1_bins, region2_bins)) %>%
+  pivot_wider(id_cols = Bin, names_from = Sample, values_from = c(Coverage, f_hat)) %>%
+  mutate(
+    ai = (Coverage_Tumor / f_hat_Tumor + 0.1) / (Coverage_Normal / f_hat_Normal + 0.1),
+    Model = "Model D",
+    Region = ifelse(Bin %in% region1_bins, "25M–30M", "75M–80M")
+  ) %>%
+  select(Bin, Region, ai, Model)
+
+
+# Combine all models
+all_models_df <- bind_rows(model_b_filtered, model_c_df, model_d_filtered)
+
+# Compute medians for annotation
+median_labels <- all_models_df %>%
+  group_by(Model, Region) %>%
+  summarize(med = round(median(ai, na.rm = TRUE), 3), .groups = "drop") %>%
+  mutate(
+    label = paste0(Model, ": ", med),
+    y = 155 - 20 * as.numeric(factor(Model)),
+    x = 1.32
+  )
+
+# Create histograms with median text
+
+# Region 25M–30M
+p1 <- ggplot(all_models_df %>% filter(Region == "25M–30M"),
+             aes(x = ai, fill = Model)) +
+  geom_histogram(position = "identity", alpha = 0.5, bins = 60) +
+  geom_vline(xintercept = 1, linetype = "dashed") +
+  geom_text(data = median_labels %>% filter(Region == "25M–30M"),
+            aes(x = x, y = y, label = label, color = Model),
+            inherit.aes = FALSE, hjust = 0, size = 4.2, show.legend = FALSE) +
+  labs(title = "Region 25M–30M",
+       x = expression(hat(a)[i]), y = "Count") +
+  theme_minimal(base_size = 13) +
+  # Hide legend on the left plot
+  theme(legend.position = "none")
+
+# Plot for Region 75M–80M
+p2 <- ggplot(all_models_df %>% filter(Region == "75M–80M"),
+             aes(x = ai, fill = Model)) +
+  geom_histogram(position = "identity", alpha = 0.5, bins = 60) +
+  geom_vline(xintercept = 1, linetype = "dashed") +
+  geom_text(data = median_labels %>% filter(Region == "75M–80M"),
+            aes(x = x, y = y, label = label, color = Model),
+            inherit.aes = FALSE, hjust = 0, size = 4.2, show.legend = FALSE) +
+  labs(title = "Region 75M–80M",
+       x = expression(hat(a)[i]), y = "Count") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "right")
+
+# Combine the two plots side-by-side with shared legend at the bottom
+p1 + p2 + plot_layout(guides = "collect") & theme(legend.position = 'bottom')
+
+
+```
+
+
+
+The histogram of \( \hat{a}_i \) values highlights key differences between the models across the two regions.  
+**Model D** (blue) consistently shows the most symmetric and narrow distribution, centered near 1 — which suggests stable and reliable estimates.  
+In the 25M–30M region, its median was closest to 1 and the spread was minimal.  
+In the 75M–80M region, **Model C** (green) had a slightly better median, but the distribution was much wider and more variable.  
+**Model B** (red) was more centered than C, but less stable than D.  
+Overall, these results support the conclusion that **Model D** provides the most consistent and accurate copy number estimation across regions.
+
+### Violin plot
+
+```{r, message=FALSE, warning=FALSE}
+library(ggplot2)
+
+# Violin plot showing all models over both genomic regions combined
+ggplot(all_models_df, aes(x = Model, y = ai, fill = Model)) +
+  geom_violin(alpha = 0.6, color = "black") +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "black") +
+  scale_fill_manual(values = c("Model B" = "#fdae61",
+                               "Model C" = "#abdda4",
+                               "Model D" = "#2b83ba")) +
+  labs(
+    title = expression("Violin Plot of Estimated " * hat(a)[i] * 
+                       " per Model (Combined Regions)"),
+    x = "Model",
+    y = expression(hat(a)[i])
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.title = element_text(face = "bold"),
+    legend.position = "none"
+  )
+
+
+```
+
+
+The violin plot shows how the values of \( \hat{a}_i \) are distributed for each model, across both genomic regions.  
+We can see that **Model D** has the most concentrated and symmetric shape around 1, which means it's the most stable and consistent.  
+**Model C** looks a lot more spread out, especially toward the lower end, which suggests it might be noisier or underestimate copy numbers.  
+**Model B** is somewhere in between — not as tight as D, but more centered than C.  
+
+So even though all models are roughly centered around 1, **Model D clearly does it with the least noise**, making it the most reliable overall.
+
+
+
+**In summary:**  
+
+Through a step-by-step comparison of Models A through D, we saw how different correction strategies affect our ability to detect true CNV patterns. The combination of GC correction and comparison to a normal sample — as done in Model D, gave us the most stable results, especially in GC-rich regions.
+
+Simpler models like B and C were easier to apply but had clear downsides — either from not correcting GC bias or from not accounting for shared technical effects. Overall, this lab helped us understand the strengths and trade-offs of each modeling choice and how important preprocessing and bias correction are in genomic data analysis.
+
+
+**One thing We've learned**:
+
+Even small technical biases like GC content can have a huge impact on sequencing coverage — and if we don’t correct for them properly, we might completely miss or misinterpret copy number changes. That’s why combining multiple corrections (like in Model D) is so powerful: it helps isolate the biological signal from all the background noise.
+
+
