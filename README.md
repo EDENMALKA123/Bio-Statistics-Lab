@@ -1,4 +1,8 @@
+[View Interactive Labs Website](https://edenmalka123.github.io/Bio-Statistics-Lab/)
+
 # Biostatistics Computational Lab – CNV and GC-Bias Modeling
+
+<img src="images/image1.png" width="700" alt="Coverage vs GC Content – Cleaned Data">
 
 This repository documents our semester-long work in the Biostatistics Laboratory course, focusing on statistical modeling of genomic coverage, GC-content bias correction, and simulation-based validation.  
 The project gradually builds a full CNV (Copy Number Variation) analysis pipeline using real and simulated sequencing data.
@@ -55,6 +59,14 @@ We compared the performance of **Model B, Model C, and Model D**, each represent
 Key evaluation criteria included the proportion of bins retained after IQR-based outlier filtering, **Mean Absolute Error**, and the stability of coverage across genomic regions (e.g., 26.5M–28.5M).  
 The analysis demonstrated that combining GC correction with adaptive smoothing (Spline + LOESS) provided the most consistent and biologically interpretable results.  
 This final stage integrated all prior modeling, simulation, and correction steps into a cohesive and validated CNV detection workflow.
+
+---
+
+### **Regional Model Performance**
+<img src="images/image2.png" width="850" alt="Regional GC Correction Models">
+
+This figure summarizes regional spline fits across four genomic segments, showing both training and test sets.  
+High $R^2$ and low MAE values demonstrate consistent GC correction and stable model generalization across genomic regions.
 
 ---
 
