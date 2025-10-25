@@ -77,5 +77,5 @@ Each lab reflected a deeper layer of insight — from exploratory analysis to mo
 ---
 
 *Created by Eden Malka, Salome Baranes, and Omer Abuhatzira – 2025* 
-© 2025 Eden Malka. All rights reserved.
+© All rights reserved.
 
